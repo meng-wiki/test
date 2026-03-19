@@ -13,7 +13,7 @@ class VEQ3D_Solver:
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
         self.M_pol = 0
-        self.N_tor = 1
+        self.N_tor = 2
         self.L_rad = 2
         # =========================================================
         
@@ -202,8 +202,7 @@ class VEQ3D_Solver:
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
 
-    def _build_jax_residual_fn(self, P_multiplier=1.0):
-        """传入 P_multiplier 用于压强缩放以实现延拓法计算"""
+    def _build_jax_residual_fn(self):
         RHO = jnp.array(self.RHO)
         TH = jnp.array(self.TH)
         ZE = jnp.array(self.ZE)
@@ -349,11 +348,9 @@ class VEQ3D_Solver:
                 Lt = 0.0
                 Lz = 0.0
             
-            # 使用 P_multiplier 对压强进行比例放缩，实现分步延拓求解
-            P_scale = 1.8e4 * P_multiplier
+            P_scale = 1.8e4 
             P = P_scale * (RHO**2 - 1)**2
             dP = P_scale * 4 * RHO * (RHO**2 - 1)
-            
             Phip = 2 * RHO * Phi_a
             iota = 1.0 + 1.5 * RHO**2
             psip = iota * Phip
@@ -443,9 +440,9 @@ class VEQ3D_Solver:
             
         return jax_res_fn
 
-    def _run_optimization(self, x0, max_nfev, ftol, P_multiplier=1.0):
-        """传入 P_multiplier 来进行残差函数的重构"""
-        jax_res_fn = self._build_jax_residual_fn(P_multiplier)
+    def _run_optimization(self, x0, max_nfev, ftol):
+        """最原始的 TRF 调用，没有任何花里胡哨的缩放参数"""
+        jax_res_fn = self._build_jax_residual_fn()
         
         @jax.jit
         def res_compiled(x):
@@ -482,7 +479,7 @@ class VEQ3D_Solver:
         return res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (分步延拓 DESC 策略)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (极简纯净三级火箭版)...")
         
         # ==========================================================
         # 网格自适应算法：自动推导满足 1/3 安全底线的网格，保证偶数防混叠
@@ -496,69 +493,40 @@ class VEQ3D_Solver:
         m_Nt = make_even(c_Nt + 8)
         m_Nz = make_even(c_Nz + 4)
 
-        x_guess = np.zeros(self.num_core_params)
-
         # ==========================================================
-        # 阶段 1：低分辨率，无压强 (P = 0)
-        # 寻找纯粹的真空磁场几何构型
+        # 阶段 1：极粗网格寻向 (Extremely Coarse Grid) - 限制步数早停
         # ==========================================================
         print("\n" + "="*70)
-        print(f">>> [Stage 1/6]: 低分辨率, P = 0 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
+        print(f">>> [Phase 1/3]: 极粗网格冷启动寻向 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
         print("="*70)
         self.update_grid(Nr=c_Nr, Nt_grid=c_Nt, Nz_grid=c_Nz)
-        res = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2, P_multiplier=0.0)
-        x_guess = res.x
+        x_guess = np.zeros(self.num_core_params)
+        
+        res_very_coarse = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2)
 
         # ==========================================================
-        # 阶段 2：低分辨率，施加微小压强 (P = 0.1 * P_max)
+        # 阶段 2：中等网格精炼 (Medium Grid Refinement)
         # ==========================================================
         print("\n" + "="*70)
-        print(f">>> [Stage 2/6]: 低分辨率, P = 0.1 * P_max (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
-        print("="*70)
-        res = self._run_optimization(x_guess, max_nfev=40, ftol=1e-3, P_multiplier=0.1)
-        x_guess = res.x
-
-        # ==========================================================
-        # 阶段 3：低分辨率，施加中等压强 (P = 0.5 * P_max)
-        # ==========================================================
-        print("\n" + "="*70)
-        print(f">>> [Stage 3/6]: 低分辨率, P = 0.5 * P_max (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
-        print("="*70)
-        res = self._run_optimization(x_guess, max_nfev=50, ftol=1e-3, P_multiplier=0.5)
-        x_guess = res.x
-
-        # ==========================================================
-        # 阶段 4：低分辨率，达到全压强极限 (P = 1.0 * P_max)
-        # ==========================================================
-        print("\n" + "="*70)
-        print(f">>> [Stage 4/6]: 低分辨率, P = 1.0 * P_max (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
-        print("="*70)
-        res = self._run_optimization(x_guess, max_nfev=60, ftol=1e-4, P_multiplier=1.0)
-        x_guess = res.x
-
-        # ==========================================================
-        # 阶段 5：中等网格精炼 (Medium Grid Refinement), P = 1.0 * P_max
-        # ==========================================================
-        print("\n" + "="*70)
-        print(f">>> [Stage 5/6]: 中等分辨率精炼, P = 1.0 * P_max (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz})")
+        print(f">>> [Phase 2/3]: 中等网格形貌精炼 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz})")
         print("="*70)
         self.update_grid(Nr=m_Nr, Nt_grid=m_Nt, Nz_grid=m_Nz)
-        res = self._run_optimization(x_guess, max_nfev=100, ftol=1e-5, P_multiplier=1.0)
-        x_guess = res.x
+        
+        res_coarse = self._run_optimization(res_very_coarse.x, max_nfev=60, ftol=1e-5)
 
         # ==========================================================
-        # 阶段 6：目标高保真网格终极收敛 (Fine Grid Final Polish)
+        # 阶段 3：目标高保真网格终极收敛 (Fine Grid Final Polish)
         # ==========================================================
         print("\n" + "="*70)
-        print(f">>> [Stage 6/6]: 高分辨率极限收敛, P = 1.0 * P_max (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
+        print(f">>> [Phase 3/3]: 高保真网格极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
         print("="*70)
         self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
-        res = self._run_optimization(x_guess, max_nfev=1000, ftol=1e-12, P_multiplier=1.0)
-        x_guess = res.x
+        
+        res_fine = self._run_optimization(res_coarse.x, max_nfev=1000, ftol=1e-12)
 
-        self.print_final_parameters(x_guess)
-        self.plot_equilibrium(x_guess)
-        return x_guess
+        self.print_final_parameters(res_fine.x)
+        self.plot_equilibrium(res_fine.x)
+        return res_fine.x
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         rho, theta, zeta = np.atleast_1d(rho), np.atleast_1d(theta), np.atleast_1d(zeta)
