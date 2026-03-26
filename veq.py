@@ -12,8 +12,8 @@ class VEQ3D_Solver:
         # =========================================================
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
-        self.M_pol = 1
-        self.N_tor = 1
+        self.M_pol = 4
+        self.N_tor = 4
         self.L_rad = 1
         # =========================================================
         
@@ -211,9 +211,6 @@ class VEQ3D_Solver:
             res_reg = np.array([h_c[0], v_c[0]]) * 100.0
             return np.concatenate([res_geom, res_reg])
             
-        # ==========================================================
-        # [极致优化]: 边界热启动机制
-        # ==========================================================
         if self.p_edge is not None and len(self.p_edge) == self.num_edge_params:
             p0 = self.p_edge.copy()
         else:
@@ -308,27 +305,40 @@ class VEQ3D_Solver:
             e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
             c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
 
+            # ========================================================
+            # [核心提速优化] 1D 和 2D 求解器全部改用 CPU 最爱的内积+Einsum
+            # 彻底摒弃内存开销巨大的多维张量 Broadcasting
+            # ========================================================
             def eval_1d(c_e, c_c):
-                core_contrib = jnp.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
-                ce_eff = c_e[:, None, None, None] + core_contrib
-                val = jnp.sum(ce_eff * basis_1d_val, axis=0)
-                dz  = jnp.sum(ce_eff * basis_1d_dz,  axis=0)
-                dr_contrib = jnp.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
-                dr  = jnp.sum(dr_contrib * basis_1d_val, axis=0)
+                # c_c: (L_rad, len_1d) -> .T -> (len_1d, L_rad)
+                # fac_rad: (L_rad, Nr) 
+                core_contrib = jnp.dot(c_c.T, fac_rad)  # (len_1d, Nr)
+                ce_eff = c_e[:, None] + core_contrib    # (len_1d, Nr)
+                
+                b_val = basis_1d_val[:, 0, 0, :]        # (len_1d, Nz)
+                b_dz  = basis_1d_dz[:, 0, 0, :]         # (len_1d, Nz)
+                
+                val = jnp.einsum('mr,mz->rz', ce_eff, b_val)[:, None, :] # (Nr, 1, Nz)
+                dz  = jnp.einsum('mr,mz->rz', ce_eff, b_dz)[:, None, :]  # (Nr, 1, Nz)
+                
+                dr_contrib = jnp.dot(c_c.T, dfac_rad)   # (len_1d, Nr)
+                dr  = jnp.einsum('mr,mz->rz', dr_contrib, b_val)[:, None, :]
                 return val, dr, dz
 
             def eval_2d(c_e, c_c):
                 if len_2d == 0: 
                     return 0.0, 0.0, 0.0, 0.0
-                core_contrib = jnp.sum(c_c[:, :, None, None, None] * fac_rad[:, None, :, None, None], axis=0)
-                ce_eff = c_e[:, None, None, None] + core_contrib
-                val = jnp.sum(ce_eff * basis_2d_val, axis=0)
-                dth = jnp.sum(ce_eff * basis_2d_dth, axis=0)
-                dz  = jnp.sum(ce_eff * basis_2d_dze, axis=0)
+                core_contrib = jnp.dot(c_c.T, fac_rad)  # (len_2d, Nr)
+                ce_eff = c_e[:, None] + core_contrib    # (len_2d, Nr)
                 
-                # 乘积法则求关于径向的导数: dr = (d(ce_eff)/drho) * basis + ce_eff * d(basis)/drho
-                dr_contrib = jnp.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
-                dr  = jnp.sum(dr_contrib * basis_2d_val + ce_eff * basis_2d_dr, axis=0)
+                # 张量收缩: (len_2d, Nr) x (len_2d, Nr, Nt, Nz) -> (Nr, Nt, Nz)
+                val = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_val)
+                dth = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dth)
+                dz  = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dze)
+                
+                dr_contrib = jnp.dot(c_c.T, dfac_rad)   # (len_2d, Nr)
+                dr = jnp.einsum('mr,mrtz->rtz', dr_contrib, basis_2d_val) + \
+                     jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dr)
                 return val, dr, dth, dz
 
             c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
@@ -358,7 +368,7 @@ class VEQ3D_Solver:
             Zz = vz + kz * RHO * a * jnp.sin(thZ) + k * RHO * az * jnp.sin(thZ) + k * RHO * a * jnp.cos(thZ) * thZ_z
 
             det_phys = Rr * Zt - Rt * Zr
-            # 使用原汁原味的防御机制
+            # 防御机制
             det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, -1e-13, det_phys)
             
             sqrt_g = (R / Nt) * det_safe
@@ -368,9 +378,11 @@ class VEQ3D_Solver:
             g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
 
             if len_lam > 0:
-                lam_eff = jnp.sum(c_lam[:, :, None, None, None] * L_fac_rad[:, None, :, None, None], axis=0) 
-                Lt = jnp.sum(lam_eff * basis_lam_dth, axis=0)
-                Lz = jnp.sum(lam_eff * basis_lam_dze, axis=0)
+                lam_ce = jnp.dot(c_lam.T, L_fac_rad) # (len_lam, Nr)
+                b_dth = basis_lam_dth[:, 0, :, :]    # (len_lam, Nt, Nz)
+                b_dze = basis_lam_dze[:, 0, :, :]    # (len_lam, Nt, Nz)
+                Lt = jnp.einsum('mr,mtz->rtz', lam_ce, b_dth)
+                Lz = jnp.einsum('mr,mtz->rtz', lam_ce, b_dze)
             else:
                 Lt = 0.0
                 Lz = 0.0
@@ -417,9 +429,9 @@ class VEQ3D_Solver:
             basis_1d_tz = basis_1d_val[:, 0, 0, :]
             
             def integ_1d(term):
-                term_t = jnp.sum(term, axis=1)
-                term_tz = term_t @ basis_1d_tz.T
-                return fac_rad @ term_tz
+                term_t = jnp.sum(term, axis=1) # (Nr, Nz)
+                term_tz = jnp.dot(term_t, basis_1d_tz.T) # (Nr, len_1d)
+                return jnp.dot(fac_rad, term_tz) # (L_rad, len_1d)
                 
             res1 = integ_1d(term1)
             res2 = integ_1d(term2)
@@ -434,13 +446,11 @@ class VEQ3D_Solver:
                 term7 = GR * (-RHO * a * jnp.sin(thR)) * vol_w
                 term8 = GZ * (k * RHO * a * jnp.cos(thZ)) * vol_w
                 
-                # basis_2d_val 现在为三维 (len_2d, Nr, Nt, Nz)
+                # [内存/速度优化点]: 同样用 einsum 替换原先巨大的 5维 张量广播
                 def integ_2d(term):
-                    # 将 term 与 basis相乘并在角向求和 (2, 3维度) 形成 (len_2d, Nr) 的中间量
-                    term_b = term[None, :, :, :] * basis_2d_val
-                    term_r = jnp.sum(term_b, axis=(2, 3))
-                    # 最后与径向芯部基函数矩阵做内积运算求得系数投影 (L_rad, len_2d)
-                    return fac_rad @ term_r.T
+                    # term: (Nr, Nt, Nz), basis_2d_val: (len_2d, Nr, Nt, Nz)
+                    term_r = jnp.einsum('rtz,mrtz->mr', term, basis_2d_val) # (len_2d, Nr)
+                    return jnp.dot(fac_rad, term_r.T) # (L_rad, len_2d)
                     
                 geom_res_list.append(integ_2d(term7))
                 geom_res_list.append(integ_2d(term8))
@@ -460,7 +470,6 @@ class VEQ3D_Solver:
             if apply_scaling:
                 final_res = final_res / res_scales
                 
-            # [修正符号Bug]: 恢复最原始的惩罚结构，但修复方向为 < 1e-5，防折叠自爆
             penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
             final_res = final_res * (1.0 + penalty)  
                 
@@ -469,7 +478,6 @@ class VEQ3D_Solver:
         return jax_res_fn
 
     def _run_optimization(self, x0, max_nfev, ftol):
-        """最原始的 TRF 调用，没有任何花里胡哨的缩放参数"""
         jax_res_fn = self._build_jax_residual_fn()
         
         @jax.jit
@@ -509,9 +517,6 @@ class VEQ3D_Solver:
     def solve(self):
         print(">>> 启动 VEQ-3D 谱精度平衡求解器 (极简纯净三级火箭版)...")
         
-        # ==========================================================
-        # 网格自适应算法：自动推导满足 1/3 安全底线的网格，保证偶数防混叠
-        # ==========================================================
         def make_even(x): return x + (x % 2)
         c_Nr = make_even(max(8, 4 * self.L_rad + 2))
         c_Nt = make_even(max(12, 4 * self.M_pol + 4))
@@ -521,9 +526,6 @@ class VEQ3D_Solver:
         m_Nt = make_even(c_Nt + 8)
         m_Nz = make_even(c_Nz + 4)
 
-        # ==========================================================
-        # 阶段 1：极粗网格寻向 (Extremely Coarse Grid) - 限制步数早停
-        # ==========================================================
         print("\n" + "="*70)
         print(f">>> [Phase 1/3]: 极粗网格冷启动寻向 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
         print("="*70)
@@ -532,9 +534,6 @@ class VEQ3D_Solver:
         
         res_very_coarse = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2)
 
-        # ==========================================================
-        # 阶段 2：中等网格精炼 (Medium Grid Refinement)
-        # ==========================================================
         print("\n" + "="*70)
         print(f">>> [Phase 2/3]: 中等网格形貌精炼 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz})")
         print("="*70)
@@ -542,9 +541,6 @@ class VEQ3D_Solver:
         
         res_coarse = self._run_optimization(res_very_coarse.x, max_nfev=60, ftol=1e-5)
 
-        # ==========================================================
-        # 阶段 3：目标高保真网格终极收敛 (Fine Grid Final Polish)
-        # ==========================================================
         print("\n" + "="*70)
         print(f">>> [Phase 3/3]: 高保真网格极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
         print("="*70)
@@ -588,7 +584,6 @@ class VEQ3D_Solver:
             if self.len_2d == 0: return val
             for i, (m, n, typ) in enumerate(self.modes_2d):
                 b = np.cos(m * theta - n * zeta) if typ == 'c' else np.sin(m * theta - n * zeta)
-                # 乘上要求的 rho^m 因子
                 b = b * (rho ** m)
                 val = val + (c_e[i] + np.tensordot(c_c[:, i], fac_rad, axes=(0, 0))) * b
             return val
