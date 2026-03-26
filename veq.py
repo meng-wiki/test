@@ -83,6 +83,7 @@ class VEQ3D_Solver:
         self.num_edge_params = 2 + 6 * self.len_1d + 2 * self.len_2d
 
     def _build_basis_matrices(self):
+        # --- 1D 模式基底构建 ---
         self.basis_1d_val = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_dz  = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_val[0, 0, 0, :] = 1.0
@@ -91,16 +92,40 @@ class VEQ3D_Solver:
             self.basis_1d_val[idx, 0, 0, :] = np.cos(n * self.ZE[0,0,:]); self.basis_1d_dz[idx, 0, 0, :] = -n * np.sin(n * self.ZE[0,0,:]); idx+=1
             self.basis_1d_val[idx, 0, 0, :] = np.sin(n * self.ZE[0,0,:]); self.basis_1d_dz[idx, 0, 0, :] =  n * np.cos(n * self.ZE[0,0,:]); idx+=1
             
-        self.basis_2d_val = np.zeros((self.len_2d, 1, self.Nt_grid, self.Nz_grid))
-        self.basis_2d_dth = np.zeros((self.len_2d, 1, self.Nt_grid, self.Nz_grid))
-        self.basis_2d_dze = np.zeros((self.len_2d, 1, self.Nt_grid, self.Nz_grid))
+        # --- 2D 模式基底构建 (包含 rho^m 因子) ---
+        self.basis_2d_val = np.zeros((self.len_2d, self.Nr, self.Nt_grid, self.Nz_grid))
+        self.basis_2d_dr  = np.zeros((self.len_2d, self.Nr, self.Nt_grid, self.Nz_grid))
+        self.basis_2d_dth = np.zeros((self.len_2d, self.Nr, self.Nt_grid, self.Nz_grid))
+        self.basis_2d_dze = np.zeros((self.len_2d, self.Nr, self.Nt_grid, self.Nz_grid))
+        self.basis_2d_edge = np.zeros((self.len_2d, self.Nt_grid, self.Nz_grid))
+        
         for i, (m, n, typ) in enumerate(self.modes_2d):
-            phase = m * self.TH[0,:,:] - n * self.ZE[0,:,:]
-            if typ == 'c':
-                self.basis_2d_val[i, 0, :, :] = np.cos(phase); self.basis_2d_dth[i, 0, :, :] = -m * np.sin(phase); self.basis_2d_dze[i, 0, :, :] =  n * np.sin(phase)
+            phase = m * self.TH - n * self.ZE
+            rho_m = self.RHO ** m
+            
+            # 边界上的无 rho 影响基底(此时 rho=1)
+            phase_edge = m * self.TH[0,:,:] - n * self.ZE[0,:,:]
+            
+            # 解析径向导数 d(rho^m)/drho
+            if m == 0:
+                drho_m = np.zeros_like(self.RHO)
             else:
-                self.basis_2d_val[i, 0, :, :] = np.sin(phase); self.basis_2d_dth[i, 0, :, :] =  m * np.cos(phase); self.basis_2d_dze[i, 0, :, :] = -n * np.cos(phase)
+                drho_m = m * (self.RHO ** (m - 1))
                 
+            if typ == 'c':
+                self.basis_2d_val[i, :, :, :] = rho_m * np.cos(phase)
+                self.basis_2d_dr[i, :, :, :]  = drho_m * np.cos(phase)
+                self.basis_2d_dth[i, :, :, :] = rho_m * (-m * np.sin(phase))
+                self.basis_2d_dze[i, :, :, :] = rho_m * (n * np.sin(phase))
+                self.basis_2d_edge[i] = np.cos(phase_edge)
+            else:
+                self.basis_2d_val[i, :, :, :] = rho_m * np.sin(phase)
+                self.basis_2d_dr[i, :, :, :]  = drho_m * np.sin(phase)
+                self.basis_2d_dth[i, :, :, :] = rho_m * (m * np.cos(phase))
+                self.basis_2d_dze[i, :, :, :] = rho_m * (-n * np.cos(phase))
+                self.basis_2d_edge[i] = np.sin(phase_edge)
+                
+        # --- 磁流函数 Lambda 模式基底 ---
         self.basis_lam_val = np.zeros((self.len_lam, 1, self.Nt_grid, self.Nz_grid))
         self.basis_lam_dth = np.zeros((self.len_lam, 1, self.Nt_grid, self.Nz_grid))
         self.basis_lam_dze = np.zeros((self.len_lam, 1, self.Nt_grid, self.Nz_grid))
@@ -164,7 +189,7 @@ class VEQ3D_Solver:
         Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
         
         def eval_1d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
-        def eval_2d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_2d_val[:, 0, ...], axis=0) if self.len_2d > 0 else 0.0
+        def eval_2d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_2d_edge, axis=0) if self.len_2d > 0 else 0.0
 
         def boundary_residuals(p):
             R0, Z0 = p[0], p[1]
@@ -188,7 +213,6 @@ class VEQ3D_Solver:
             
         # ==========================================================
         # [极致优化]: 边界热启动机制
-        # 网格刷新时继承已有边界参数，杜绝“边界相位漂移冲击”
         # ==========================================================
         if self.p_edge is not None and len(self.p_edge) == self.num_edge_params:
             p0 = self.p_edge.copy()
@@ -211,6 +235,7 @@ class VEQ3D_Solver:
         basis_1d_val = jnp.array(self.basis_1d_val)
         basis_1d_dz = jnp.array(self.basis_1d_dz)
         basis_2d_val = jnp.array(self.basis_2d_val)
+        basis_2d_dr = jnp.array(self.basis_2d_dr)
         basis_2d_dth = jnp.array(self.basis_2d_dth)
         basis_2d_dze = jnp.array(self.basis_2d_dze)
         basis_lam_val = jnp.array(self.basis_lam_val)
@@ -300,8 +325,10 @@ class VEQ3D_Solver:
                 val = jnp.sum(ce_eff * basis_2d_val, axis=0)
                 dth = jnp.sum(ce_eff * basis_2d_dth, axis=0)
                 dz  = jnp.sum(ce_eff * basis_2d_dze, axis=0)
+                
+                # 乘积法则求关于径向的导数: dr = (d(ce_eff)/drho) * basis + ce_eff * d(basis)/drho
                 dr_contrib = jnp.sum(c_c[:, :, None, None, None] * dfac_rad[:, None, :, None, None], axis=0)
-                dr  = jnp.sum(dr_contrib * basis_2d_val, axis=0)
+                dr  = jnp.sum(dr_contrib * basis_2d_val + ce_eff * basis_2d_dr, axis=0)
                 return val, dr, dth, dz
 
             c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
@@ -406,11 +433,14 @@ class VEQ3D_Solver:
             if len_2d > 0:
                 term7 = GR * (-RHO * a * jnp.sin(thR)) * vol_w
                 term8 = GZ * (k * RHO * a * jnp.cos(thZ)) * vol_w
-                basis_2d_tz = basis_2d_val[:, 0, :, :]
                 
+                # basis_2d_val 现在为三维 (len_2d, Nr, Nt, Nz)
                 def integ_2d(term):
-                    term_tz = jnp.tensordot(term, basis_2d_tz, axes=([1, 2], [1, 2]))
-                    return fac_rad @ term_tz
+                    # 将 term 与 basis相乘并在角向求和 (2, 3维度) 形成 (len_2d, Nr) 的中间量
+                    term_b = term[None, :, :, :] * basis_2d_val
+                    term_r = jnp.sum(term_b, axis=(2, 3))
+                    # 最后与径向芯部基函数矩阵做内积运算求得系数投影 (L_rad, len_2d)
+                    return fac_rad @ term_r.T
                     
                 geom_res_list.append(integ_2d(term7))
                 geom_res_list.append(integ_2d(term8))
@@ -430,8 +460,6 @@ class VEQ3D_Solver:
             if apply_scaling:
                 final_res = final_res / res_scales
                 
-            # 完全去除 Tikhonov，保持纯净！
-            
             # [修正符号Bug]: 恢复最原始的惩罚结构，但修复方向为 < 1e-5，防折叠自爆
             penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
             final_res = final_res * (1.0 + penalty)  
@@ -560,6 +588,8 @@ class VEQ3D_Solver:
             if self.len_2d == 0: return val
             for i, (m, n, typ) in enumerate(self.modes_2d):
                 b = np.cos(m * theta - n * zeta) if typ == 'c' else np.sin(m * theta - n * zeta)
+                # 乘上要求的 rho^m 因子
+                b = b * (rho ** m)
                 val = val + (c_e[i] + np.tensordot(c_c[:, i], fac_rad, axes=(0, 0))) * b
             return val
 
