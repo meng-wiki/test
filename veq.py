@@ -12,9 +12,9 @@ class VEQ3D_Solver:
         # =========================================================
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
-        self.M_pol = 4
-        self.N_tor = 4
-        self.L_rad = 1
+        self.M_pol = 2
+        self.N_tor = 2
+        self.L_rad = 2
         # =========================================================
         
         self.Nt = 19
@@ -254,6 +254,12 @@ class VEQ3D_Solver:
         dtheta = self.dtheta
         dzeta = self.dzeta
 
+        # 提取各个Lambda模式的极向阶数m，用于构造 rho^m
+        if self.len_lam > 0:
+            lam_m_vals = jnp.array([m for m, n in self.lambda_modes])
+        else:
+            lam_m_vals = jnp.array([])
+
         def jax_unpack_edge(p):
             idx = 2
             def get(L):
@@ -300,7 +306,6 @@ class VEQ3D_Solver:
             
             fac_rad = (1.0 - rho_1d**2) * T
             dfac_rad = -2.0 * rho_1d * T + 4.0 * rho_1d * (1.0 - rho_1d**2) * dTdx
-            L_fac_rad = rho_1d[None, :] * T
             
             e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
             c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
@@ -378,7 +383,10 @@ class VEQ3D_Solver:
             g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
 
             if len_lam > 0:
-                lam_ce = jnp.dot(c_lam.T, L_fac_rad) # (len_lam, Nr)
+                # [向量化更新]: 构造针对各Lambda模式具有 rho^m 衰减特性的系数
+                rho_m_lam = rho_1d[None, :] ** lam_m_vals[:, None] # (len_lam, Nr)
+                lam_ce = jnp.dot(c_lam.T, T) * rho_m_lam           # (len_lam, Nr)
+                
                 b_dth = basis_lam_dth[:, 0, :, :]    # (len_lam, Nt, Nz)
                 b_dze = basis_lam_dze[:, 0, :, :]    # (len_lam, Nt, Nz)
                 Lt = jnp.einsum('mr,mtz->rtz', lam_ce, b_dth)
@@ -461,8 +469,10 @@ class VEQ3D_Solver:
             if len_lam > 0:
                 term_lam = Jr_phys * vol_w
                 basis_lam_tz = basis_lam_val[:, 0, :, :]
-                term_lam_tz = jnp.tensordot(term_lam, basis_lam_tz, axes=([1, 2], [1, 2]))
-                res_lam = L_fac_rad @ term_lam_tz
+                term_lam_tz = jnp.tensordot(term_lam, basis_lam_tz, axes=([1, 2], [1, 2])) # (Nr, len_lam)
+                
+                # [向量化更新]: 使用更新后且包含 rho^m 缩放规律的基底执行内积残差投影
+                res_lam = jnp.dot(T, rho_m_lam.T * term_lam_tz) # (L_rad, len_lam)
                 final_res_list.append(res_lam.flatten())
                 
             final_res = jnp.concatenate(final_res_list)
@@ -563,7 +573,6 @@ class VEQ3D_Solver:
             T[l] = 2.0 * x * T[l-1] - T[l-2]
             
         fac_rad = (1.0 - rho**2) * T  
-        L_fac_rad = rho * T     
         
         e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
@@ -599,7 +608,9 @@ class VEQ3D_Solver:
         
         lam = np.zeros_like(base_grid)
         for i, (m, n) in enumerate(self.lambda_modes):
-            lam = lam + np.tensordot(c_lam[:, i], L_fac_rad, axes=(0, 0)) * np.sin(m * theta - n * zeta)
+            # [评估时更新]: 针对特定的 (m, n) 模式应用 rho^m 进行计算展开
+            L_fac_rad_m = (rho ** m) * T
+            lam = lam + np.tensordot(c_lam[:, i], L_fac_rad_m, axes=(0, 0)) * np.sin(m * theta - n * zeta)
             
         return R, Z, thR, thZ, a, k, lam
 
@@ -644,7 +655,7 @@ class VEQ3D_Solver:
                 tZ_str = f"tZ_{m}_{n}{typ:<10} | {e_tZ[i]:>25.8e} | " + " | ".join([f"{c_tZ[L, i]:>22.8e}" for L in range(self.L_rad)])
                 print(tZ_str)
                 
-        print("-" * 110); print(f">>> 磁流函数 (Lambda) 谐波分量 ( 比例因子: rho*(1-rho^2)*T_l(x) ):")
+        print("-" * 110); print(f">>> 磁流函数 (Lambda) 谐波分量 ( 比例因子: rho^m * T_l(x) ):") # 更新了此处的提示文案
         for i, (m, n) in enumerate(self.lambda_modes):
             L_str = f"L_{m}_{n:<12} | {'-- Null --':>25} | " + " | ".join([f"{c_lam[L, i]:>22.8e}" for L in range(self.L_rad)])
             print(L_str)
