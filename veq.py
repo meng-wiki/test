@@ -12,8 +12,8 @@ class VEQ3D_Solver:
         # =========================================================
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
-        self.M_pol = 2
-        self.N_tor = 2
+        self.M_pol = 1
+        self.N_tor = 1
         self.L_rad = 2
         # =========================================================
         
@@ -22,9 +22,9 @@ class VEQ3D_Solver:
         self.mu_0 = 4 * np.pi * 1e-7
         
         # 保存目标高精度网格尺寸
-        self.target_Nr = 24
+        self.target_Nr = 32
         self.target_Nt = 32
-        self.target_Nz = 16
+        self.target_Nz = 32
         
         self.p_edge = None  # 增加初始化，用于后续的边界热启动
         
@@ -385,7 +385,7 @@ class VEQ3D_Solver:
             if len_lam > 0:
                 # [向量化更新]: 构造针对各Lambda模式具有 rho^m 衰减特性的系数
                 rho_m_lam = rho_1d[None, :] ** lam_m_vals[:, None] # (len_lam, Nr)
-                lam_ce = jnp.dot(c_lam.T, T) * rho_m_lam           # (len_lam, Nr)
+                lam_ce = jnp.dot(c_lam.T, T) * rho_m_lam * (1.0 - rho_1d**2)**2
                 
                 b_dth = basis_lam_dth[:, 0, :, :]    # (len_lam, Nt, Nz)
                 b_dze = basis_lam_dze[:, 0, :, :]    # (len_lam, Nt, Nz)
@@ -472,7 +472,8 @@ class VEQ3D_Solver:
                 term_lam_tz = jnp.tensordot(term_lam, basis_lam_tz, axes=([1, 2], [1, 2])) # (Nr, len_lam)
                 
                 # [向量化更新]: 使用更新后且包含 rho^m 缩放规律的基底执行内积残差投影
-                res_lam = jnp.dot(T, rho_m_lam.T * term_lam_tz) # (L_rad, len_lam)
+                fac_lam = (1.0 - rho_1d**2) * T
+                res_lam = jnp.dot(fac_lam, rho_m_lam.T * term_lam_tz)
                 final_res_list.append(res_lam.flatten())
                 
             final_res = jnp.concatenate(final_res_list)
@@ -609,7 +610,7 @@ class VEQ3D_Solver:
         lam = np.zeros_like(base_grid)
         for i, (m, n) in enumerate(self.lambda_modes):
             # [评估时更新]: 针对特定的 (m, n) 模式应用 rho^m 进行计算展开
-            L_fac_rad_m = (rho ** m) * T
+            L_fac_rad_m = (rho ** m) * (1 - rho**2) * T
             lam = lam + np.tensordot(c_lam[:, i], L_fac_rad_m, axes=(0, 0)) * np.sin(m * theta - n * zeta)
             
         return R, Z, thR, thZ, a, k, lam
