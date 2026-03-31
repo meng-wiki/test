@@ -13,7 +13,7 @@ class VEQ3D_Solver:
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
         self.M_pol = 1
-        self.N_tor = 3
+        self.N_tor = 1
         self.L_rad = 3
         # =========================================================
         
@@ -22,9 +22,9 @@ class VEQ3D_Solver:
         self.mu_0 = 4 * np.pi * 1e-7
         
         # 保存目标高精度网格尺寸
-        self.target_Nr = 32
-        self.target_Nt = 32
-        self.target_Nz = 32
+        self.target_Nr = 16
+        self.target_Nt = 16
+        self.target_Nz = 16
         
         self.p_edge = None  # 增加初始化，用于后续的边界热启动
         
