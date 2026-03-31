@@ -13,8 +13,8 @@ class VEQ3D_Solver:
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
         self.M_pol = 1
-        self.N_tor = 1
-        self.L_rad = 2
+        self.N_tor = 3
+        self.L_rad = 3
         # =========================================================
         
         self.Nt = 19
@@ -226,7 +226,7 @@ class VEQ3D_Solver:
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
 
-    def _build_jax_residual_fn(self):
+    def _build_jax_residual_fn(self, pressure_scale_factor=1.0):
         RHO = jnp.array(self.RHO)
         TH = jnp.array(self.TH)
         ZE = jnp.array(self.ZE)
@@ -266,8 +266,9 @@ class VEQ3D_Solver:
         if self.len_2d > 0:
             m_vals_2d = jnp.array([m for m, n, typ in self.modes_2d])
             n_vals_2d = jnp.array([n for m, n, typ in self.modes_2d])
-            # 正则化机制 1 权重：基础权重1e-4，乘以 (m^2+n^2) 迫使高频模式尽量压缩
-            reg_weight_2d = jnp.sqrt(1e-4 * (m_vals_2d**2 + n_vals_2d**2))
+            # 正则化机制 1 权重：为避免与边界形变发生拉扯冲突，将基础权重下调到 1e-6，
+            # 并乘以 (m^2+n^2) 迫使高频模式尽量压缩。
+            reg_weight_2d = jnp.sqrt(1e-6 * (m_vals_2d**2 + n_vals_2d**2))
             
         def jax_unpack_edge(p):
             idx = 2
@@ -392,8 +393,8 @@ class VEQ3D_Solver:
                 Lz = 0.0
             
             P_scale = 1.8e4 
-            P = P_scale * (RHO**2 - 1)**2
-            dP = P_scale * 4 * RHO * (RHO**2 - 1)
+            P = pressure_scale_factor * P_scale * (RHO**2 - 1)**2
+            dP = pressure_scale_factor * P_scale * 4 * RHO * (RHO**2 - 1)
             Phip = 2 * RHO * Phi_a
             iota = 1.0 + 1.5 * RHO**2
             psip = iota * Phip
@@ -469,21 +470,27 @@ class VEQ3D_Solver:
                 res_lam = jnp.dot(fac_lam, rho_m_lam.T * term_lam_tz)
                 final_res_list.append(res_lam.flatten())
                 
-            # 基础物理残差组装
-            final_res = jnp.concatenate(final_res_list)
+            # =======================================================
+            # [解耦修改 1]：组装基础物理残差并进行物理缩放与屏障惩罚
+            # =======================================================
+            phys_res = jnp.concatenate(final_res_list)
 
             if apply_scaling:
-                final_res = final_res / res_scales
+                phys_res = phys_res / res_scales
+                
+            # 防坐标系自交/折叠的屏障惩罚 (必须且仅能应用于物理残差，防止引发优化器作弊)
+            penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
+            phys_res = phys_res * (1.0 + penalty)  
                 
             # =======================================================
-            # [新增机制] 非线性物理正则化约束扩展 (构建超定残差系统)
+            # [解耦修改 2]：非线性纯净物理正则化约束扩展 (独立拼接)
             # =======================================================
             reg_residuals = []
             
             # [机制 1] 谱压缩正则化：惩罚 tR 和 tZ
             # 迫使优化器在等效物理场中寻找一个高频分量最小的平滑 theta 坐标映射
             if len_2d > 0:
-                # 给 t_R 和 t_Z 的每个系数独立乘以 sqrt(权重)
+                # 给 t_R 和 t_Z 的每个系数独立乘以 sqrt(权重) (此时权重自身已经是无量纲合理的量级)
                 reg_tR = (c_tR * reg_weight_2d[None, :]).flatten()
                 reg_tZ = (c_tZ * reg_weight_2d[None, :]).flatten()
                 reg_residuals.extend([reg_tR, reg_tZ])
@@ -494,20 +501,19 @@ class VEQ3D_Solver:
                 reg_lam = (c_lam * jnp.sqrt(1e-6)).flatten()
                 reg_residuals.append(reg_lam)
                 
-            # 将物理残差和正则化辅助残差合并 (此时残差维度会略微超过参数维度，least_squares算法完全支持并处理这种超定系统)
+            # 将缩放后的物理残差和正则化辅助残差直接平级合并 (构建最终无量纲的超定系统)
+            # 注意：正则项不参与 res_scales 的缩放，也不参与坐标壁垒 penalty 的乘法作弊。
             if reg_residuals:
-                final_res = jnp.concatenate([final_res] + reg_residuals)
+                final_res = jnp.concatenate([phys_res] + reg_residuals)
+            else:
+                final_res = phys_res
 
-            # 防坐标系自交/折叠的屏障惩罚 (应用于整个合成残差向量)
-            penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
-            final_res = final_res * (1.0 + penalty)  
-                
             return final_res
             
         return jax_res_fn
 
-    def _run_optimization(self, x0, max_nfev, ftol):
-        jax_res_fn = self._build_jax_residual_fn()
+    def _run_optimization(self, x0, max_nfev, ftol, pressure_scale_factor=1.0):
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         
         @jax.jit
         def res_compiled(x):
@@ -538,14 +544,21 @@ class VEQ3D_Solver:
         )
         end_time = time.time()
         
+        # 计算纯物理残差（剥离末尾拼接的正则项）
+        reg_len = (2 * self.len_2d + self.len_lam) * self.L_rad
+        phys_len = len(res.fun) - reg_len
+        phys_res = res.fun[:phys_len]
+        
         print(f"    当前网格求解耗时: {end_time - start_time:.4f} 秒")
         print(f"    函数评估次数: {res.nfev} 次")
+        print(f"    纯物理残差范数 (无正则项): {np.linalg.norm(phys_res):.4e}")
         print(f"    最终合成残差范数 (含正则项): {np.linalg.norm(res.fun):.4e}")
         return res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (极简纯净三级火箭版)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (网格-压力双重延拓完美版)...")
         
+        # 动态计算不同阶段的安全网格尺寸
         def make_even(x): return x + (x % 2)
         c_Nr = make_even(max(8, 4 * self.L_rad + 2))
         c_Nt = make_even(max(12, 4 * self.M_pol + 4))
@@ -556,26 +569,27 @@ class VEQ3D_Solver:
         m_Nz = make_even(c_Nz + 4)
 
         print("\n" + "="*70)
-        print(f">>> [Phase 1/3]: 极粗网格冷启动寻向 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz})")
+        print(f">>> [Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
         print("="*70)
-        self.update_grid(Nr=c_Nr, Nt_grid=c_Nt, Nz_grid=c_Nz)
+        self.update_grid(c_Nr, c_Nt, c_Nz)
         x_guess = np.zeros(self.num_core_params)
         
-        res_very_coarse = self._run_optimization(x_guess, max_nfev=30, ftol=1e-2)
+        # 放开探索步数至 200，在低分辨率下计算极快，不会耽误时间
+        res_phase1 = self._run_optimization(x_guess, max_nfev=200, ftol=1e-3, pressure_scale_factor=0.0)
 
         print("\n" + "="*70)
-        print(f">>> [Phase 2/3]: 中等网格形貌精炼 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz})")
+        print(f">>> [Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
         print("="*70)
-        self.update_grid(Nr=m_Nr, Nt_grid=m_Nt, Nz_grid=m_Nz)
+        self.update_grid(m_Nr, m_Nt, m_Nz)
         
-        res_coarse = self._run_optimization(res_very_coarse.x, max_nfev=60, ftol=1e-5)
+        res_phase2 = self._run_optimization(res_phase1.x, max_nfev=200, ftol=1e-5, pressure_scale_factor=0.1)
 
         print("\n" + "="*70)
-        print(f">>> [Phase 3/3]: 高保真网格极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz})")
+        print(f">>> [Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz}, P=1.0)")
         print("="*70)
         self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
         
-        res_fine = self._run_optimization(res_coarse.x, max_nfev=1000, ftol=1e-12)
+        res_fine = self._run_optimization(res_phase2.x, max_nfev=1000, ftol=1e-12, pressure_scale_factor=1.0)
 
         self.print_final_parameters(res_fine.x)
         self.plot_equilibrium(res_fine.x)
@@ -634,30 +648,34 @@ class VEQ3D_Solver:
         return R, Z, thR, thZ, a, k, lam
 
     def print_final_parameters(self, x_core):
-        print("\n" + "="*110)
-        print(f"{f'VEQ-3D 动态高维参数报告 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})':^110}")
-        print("="*110)
+        # 动态计算表格排版所需的总宽度 (基础宽度46 + 每一阶L需要25个字符)
+        table_width = max(110, 46 + self.L_rad * 25)
+        
+        print("\n" + "=" * table_width)
+        print(f"{f'VEQ-3D 动态高维参数报告 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})':^{table_width}}")
+        print("=" * table_width)
         
         edge_R0, edge_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
         
         print(f"R0 (大半径中心) = {edge_R0:>15.8e}")
         print(f"Z0 (垂直中心)   = {edge_Z0:>15.8e}")
-        print("-" * 110)
+        print("-" * table_width)
         
         header_cols = [f"Chebyshev L={L} 演化系数" for L in range(self.L_rad)]
         header_str = f"{'参数标识':<15} | {'Edge 边界常量 (rho=1)':<25} | " + " | ".join([f"{h:<22}" for h in header_cols])
         print(header_str)
-        print("-" * 110)
+        print("-" * table_width)
         
         def print_1d(name, e_arr, c_arr):
             h_str = f"{name+'0':<15} | {e_arr[0]:>25.8e} | " + " | ".join([f"{c_arr[L, 0]:>22.8e}" for L in range(self.L_rad)])
             print(h_str)
             idx = 1
             for n in range(1, self.N_tor + 1):
-                c_str = f"{name+str(n)+'c':<15} | {e_arr[idx]:>25.8e} | " + " | ".join([f"{c_arr[L, idx]:>22.8e}" for L in range(self.L_rad)])
+                # 修复了 f-string 嵌套对齐问题
+                c_str = f"{f'{name}{n}c':<15} | {e_arr[idx]:>25.8e} | " + " | ".join([f"{c_arr[L, idx]:>22.8e}" for L in range(self.L_rad)])
                 print(c_str)
-                s_str = f"{name+str(n)+'s':<15} | {e_arr[idx+1]:>25.8e} | " + " | ".join([f"{c_arr[L, idx+1]:>22.8e}" for L in range(self.L_rad)])
+                s_str = f"{f'{name}{n}s':<15} | {e_arr[idx+1]:>25.8e} | " + " | ".join([f"{c_arr[L, idx+1]:>22.8e}" for L in range(self.L_rad)])
                 print(s_str)
                 idx+=2
 
@@ -666,19 +684,23 @@ class VEQ3D_Solver:
         print_1d("k_", e_k, c_k); print_1d("a_", e_a, c_a)
         
         if self.len_2d > 0:
-            print("-" * 110); print(">>> 极向高阶摄动分量 (theta_R & theta_Z) [受谱压缩正则化约束]:")
+            print("-" * table_width)
+            print(">>> 极向高阶摄动分量 (theta_R & theta_Z) [受谱压缩正则化约束]:")
             for i, (m, n, typ) in enumerate(self.modes_2d):
-                tR_str = f"tR_{m}_{n}{typ:<10} | {e_tR[i]:>25.8e} | " + " | ".join([f"{c_tR[L, i]:>22.8e}" for L in range(self.L_rad)])
+                # 修复了变量名长度变化导致的列错位
+                tR_str = f"{f'tR_{m}_{n}{typ}':<15} | {e_tR[i]:>25.8e} | " + " | ".join([f"{c_tR[L, i]:>22.8e}" for L in range(self.L_rad)])
                 print(tR_str)
             for i, (m, n, typ) in enumerate(self.modes_2d):
-                tZ_str = f"tZ_{m}_{n}{typ:<10} | {e_tZ[i]:>25.8e} | " + " | ".join([f"{c_tZ[L, i]:>22.8e}" for L in range(self.L_rad)])
+                tZ_str = f"{f'tZ_{m}_{n}{typ}':<15} | {e_tZ[i]:>25.8e} | " + " | ".join([f"{c_tZ[L, i]:>22.8e}" for L in range(self.L_rad)])
                 print(tZ_str)
                 
-        print("-" * 110); print(f">>> 磁流函数 (Lambda) 谐波分量 [受二次最小化惩罚约束]:") 
-        for i, (m, n) in enumerate(self.lambda_modes):
-            L_str = f"L_{m}_{n:<12} | {'-- Null --':>25} | " + " | ".join([f"{c_lam[L, i]:>22.8e}" for L in range(self.L_rad)])
-            print(L_str)
-        print("="*110 + "\n")
+        if self.len_lam > 0:
+            print("-" * table_width)
+            print(">>> 磁流函数 (Lambda) 谐波分量 [受二次最小化惩罚约束]:") 
+            for i, (m, n) in enumerate(self.lambda_modes):
+                L_str = f"{f'L_{m}_{n}':<15} | {'-- Null --':>25} | " + " | ".join([f"{c_lam[L, i]:>22.8e}" for L in range(self.L_rad)])
+                print(L_str)
+        print("=" * table_width + "\n")
 
     def plot_equilibrium(self, x_core):
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
