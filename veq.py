@@ -14,7 +14,7 @@ class VEQ3D_Solver:
         # =========================================================
         self.M_pol = 1
         self.N_tor = 1
-        self.L_rad = 2
+        self.L_rad = 3
         # =========================================================
         
         self.Nt = 19
@@ -258,8 +258,8 @@ class VEQ3D_Solver:
         else:
             p0 = np.zeros(self.num_edge_params)
             p0[0] = 10.0 
-            p0[2] = np.pi # c0R 初始偏置 
-            p0[2 + self.len_1d] = np.pi # c0Z 初始偏置，用于配平 sin 中增加的负号
+            p0[2] = 0 # c0R 初始偏置 
+            p0[2 + self.len_1d] = 0 # c0Z 初始偏置，用于配平 sin 中增加的负号
             p0[2 + 4 * self.len_1d] = 1.0 # k
             p0[2 + 5 * self.len_1d] = 1.0 # a
         
@@ -374,7 +374,7 @@ class VEQ3D_Solver:
             thR = TH + c0R + tR
             thZ = TH + c0Z + tZ
             
-            R = e_R0 + a * (h + RHO * jnp.cos(thR))
+            R = e_R0 + a * (h - RHO * jnp.cos(thR))
             Z = e_Z0 + a * (v - k * RHO * jnp.sin(thZ))
             
             thR_r, thR_th, thR_z = c0Rr + tRr, 1.0 + tRth, c0Rz + tRz
@@ -389,7 +389,7 @@ class VEQ3D_Solver:
             Zz = az * (v - k * RHO * jnp.sin(thZ)) + a * (vz - kz * RHO * jnp.sin(thZ) - k * RHO * jnp.cos(thZ) * thZ_z)
 
             det_phys = Rr * Zt - Rt * Zr
-            det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, -1e-13, det_phys)
+            det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, 1e-13, det_phys)
             
             sqrt_g = (R / Nt) * det_safe
             
