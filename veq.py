@@ -99,7 +99,8 @@ class VEQ3D_Solver:
         if self.len_2d > 0:
             m_vals_2d = np.array([m for m, n, typ in self.modes_2d])
             n_vals_2d = np.array([n for m, n, typ in self.modes_2d])
-            self.reg_weight_2d = np.sqrt(1e-6 * (m_vals_2d**2 + n_vals_2d**2))
+            # [方案 B] 削弱正则化项的权重，防止优化器“喧宾夺主”
+            self.reg_weight_2d = np.sqrt(1e-8 * (m_vals_2d**2 + n_vals_2d**2))
         else:
             self.reg_weight_2d = np.array([])
 
@@ -210,8 +211,12 @@ class VEQ3D_Solver:
     def _initialize_scaling(self):
         print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
         print(f">>> 总优化参数量: {self.num_core_params} 个 (几何: {self.num_geom_params}, 流函数: {self.len_lam * self.L_rad})")
-        # 无量纲化后的方程各残差均已位于 O(1) 量级附近，可以直接去除原先的暴力放缩
+        # [方案 C]：重新启用残差放缩矩阵 res_scales，对消体积元与压力的标度坍塌
+        # 相当于将物理残差统一放大 1e5 倍，让其与正则化项在优化器视角下实现权重均衡
         self.res_scales = np.ones(self.num_core_params)
+        self.res_scales[:self.num_geom_params] = 1e-5
+        if self.len_lam > 0:
+            self.res_scales[self.num_geom_params:] = 1e-5
 
     def compute_psi(self, rho):
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
@@ -251,7 +256,8 @@ class VEQ3D_Solver:
             Z_mod = Z0 + a_v * (v_v - k_v * np.sin(thZ))
             
             res_geom = np.concatenate([(R_mod - R_target_bar).flatten(), (Z_mod - Z_target_bar).flatten()])
-            res_reg = np.array([h_c[0], v_c[0]]) * 10.0
+            # [修正 4]：调整边界正则化失衡，适应无量纲化后的 O(1) 几何残差
+            res_reg = np.array([h_c[0], v_c[0]]) * 1.0
             return np.concatenate([res_geom, res_reg])
             
         if self.p_edge is not None and len(self.p_edge) == self.num_edge_params:
@@ -496,7 +502,8 @@ class VEQ3D_Solver:
                 final_res_list.append((c_tZ * reg_weight_2d[None, :]).flatten())
                 
             if len_lam > 0:
-                final_res_list.append((c_lam * jnp.sqrt(1e-6)).flatten())
+                # [方案 B]：同步削弱流函数的硬编码正则化惩罚权重
+                final_res_list.append((c_lam * jnp.sqrt(1e-8)).flatten())
                 
             return jnp.concatenate(final_res_list)
             
@@ -537,7 +544,7 @@ class VEQ3D_Solver:
         
         print(f"    当前网格求解耗时: {end_time - start_time:.4f} 秒")
         print(f"    函数评估次数: {res.nfev} 次")
-        print(f"    纯物理残差范数 (无正则项): {np.linalg.norm(phys_res):.4e}")
+        print(f"    放缩后物理残差范数 (无正则项): {np.linalg.norm(phys_res):.4e}")
         return res
 
     def solve(self):
