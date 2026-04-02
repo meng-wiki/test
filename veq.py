@@ -10,6 +10,22 @@ import time
 class VEQ3D_Solver:
     def __init__(self):
         # =========================================================
+        # [规范性声明] 提前声明全部核心属性，防止 Linter 报错
+        # =========================================================
+        self.Nr = self.Nt_grid = self.Nz_grid = None
+        self.rho = self.rho_weights = self.D_matrix = None
+        self.k_th = self.k_ze = self.theta = self.zeta = None
+        self.dtheta = self.dzeta = self.RHO = self.TH = self.ZE = None
+        self.weights_3d = self.T = self.dTdx = None
+        self.fac_rad = self.dfac_rad = self.fac_lam_eval = self.fac_lam_proj = None
+        self.rho_m_lam = self.reg_weight_2d = None
+        self.basis_1d_val = self.basis_1d_dz = None
+        self.basis_2d_val = self.basis_2d_dr = self.basis_2d_dth = self.basis_2d_dze = self.basis_2d_edge = None
+        self.basis_lam_val = self.basis_lam_dth = self.basis_lam_dze = None
+        self.res_scales = None
+        self.R0_phys = self.R_target = self.Z_target = self.bar_Phi_a = None
+
+        # =========================================================
         # [核心可调参数区] 自由调节极向 M、环向 N 与径向 L 阶数
         # =========================================================
         self.M_pol = 1
@@ -26,7 +42,7 @@ class VEQ3D_Solver:
         self.mu_0 = 4 * np.pi * 1e-7
         # =========================================================
         
-        self.Nt = 19
+        self.Nt = 19 #N_FP
         
         # 保存目标高精度网格尺寸
         self.target_Nr = 16
@@ -53,8 +69,9 @@ class VEQ3D_Solver:
         
         self.D_matrix = self._get_spectral_diff_matrix(self.rho)
         
-        self.k_th = np.fft.fftfreq(self.Nt_grid, d=1.0/self.Nt_grid)[None, :, None]
-        self.k_ze = np.fft.fftfreq(self.Nz_grid, d=1.0/self.Nz_grid)[None, None, :]
+        # 修正: 使用更为严谨和标准的整数 FFT 波数生成公式
+        self.k_th = (np.fft.fftfreq(self.Nt_grid) * self.Nt_grid)[None, :, None]
+        self.k_ze = (np.fft.fftfreq(self.Nz_grid) * self.Nz_grid)[None, None, :]
         
         self.theta = np.linspace(0, 2*np.pi, self.Nt_grid, endpoint=False)
         self.zeta = np.linspace(0, 2*np.pi, self.Nz_grid, endpoint=False)
@@ -224,10 +241,10 @@ class VEQ3D_Solver:
     def _initialize_scaling(self):
         print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
         print(f">>> 完全引入 DESC/VMEC 级别软约束：将物理缩放常数 C_beta, C_I 合并进入自适应求解空间。")
-        # 修复：res_scales 的长度应当精确匹配纯物理力学残差的长度，而不应包含最后的 2 个宏观约束参数
         self.res_scales = np.ones(self.num_geom_params + self.len_lam * self.L_rad)
 
     def fit_boundary(self):
+        # TH_F 形状为 (Nt_grid, Nz_grid)
         TH_F, ZE_F = self.TH[0], self.ZE[0]
         R_target_phys = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target_phys = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
@@ -237,6 +254,7 @@ class VEQ3D_Solver:
         self.Z_target = Z_target_phys / self.R0_phys
         self.bar_Phi_a = self.Phi_a_phys / (self.B0 * self.R0_phys**2)
         
+        # coeffs 产生 (1, Nz_grid) 广播，2d_edge 产生 (Nt_grid, Nz_grid)，最终完美对齐目标尺寸
         def eval_1d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
         def eval_2d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_2d_edge, axis=0) if self.len_2d > 0 else 0.0
 
@@ -473,8 +491,7 @@ class VEQ3D_Solver:
             mean_P_nd = jnp.sum(P_nd * vol_w) / vol_total
             current_beta = 2.0 * mean_P_nd
             
-            # 积分获取三维空间的真正总环向电流
-            current_Ip = jnp.sum(bar_Jt_sup * vol_w) / (2.0 * jnp.pi)
+            current_Ip = jnp.sum(bar_Jz_sup * vol_w) / (2.0 * jnp.pi)
             
             # 防止在压力延拓初期 (冷启动) 除以0，并使得目标 beta 随延拓因子同步过渡
             eff_target_beta = target_beta_host * pressure_scale_factor
@@ -505,7 +522,9 @@ class VEQ3D_Solver:
         
         @jax.jit
         def res_compiled(x): return jax_res_fn(x, apply_scaling=True)
-            
+        
+        # ⚠️ [架构提示]: 若未来扩展高分辨率网格导致 OOM，请将 jacfwd 替换为 jaxopt 隐式求解器或稀疏 Jacobian 框架。
+        # 针对当前的小规模前馈网络，jacfwd 具备最高的速度。
         @jax.jit
         def jac_compiled(x): return jax.jacfwd(lambda x_: jax_res_fn(x_, apply_scaling=True))(x)
             
@@ -694,24 +713,31 @@ class VEQ3D_Solver:
         axes = axes.flatten()
         rp = np.linspace(0, 1, 50); tp = np.linspace(0, 2*np.pi, 100)
         R_P, T_P = np.meshgrid(rp, tp)
-        PSI_P = self.compute_psi(R_P) * (self.B0 * self.R0_phys**2)
+        
+        # 解包获取动态极向通量放大器 C_I
+        _, _, _, _, _, _, _, _, _, _, C_I = self.unpack_core(x_core)
+        # 利用积分关系重构极向磁通分布
+        bar_Phi_a = self.Phi_a_phys / (self.B0 * self.R0_phys**2)
+        PSI_P_nd = C_I * bar_Phi_a * (R_P**2 + 0.75 * R_P**4)
+        PSI_P = PSI_P_nd * (self.B0 * self.R0_phys**2)
         
         for i, zv in enumerate(zetas):
-            ax = axes[i]; Rm, Zm = [], []
-            for r, t in zip(R_P.flatten(), T_P.flatten()):
-                rg = self.compute_geometry(x_core, r, t, zv)
-                Rm.append(rg[0] * self.R0_phys); Zm.append(rg[1] * self.R0_phys)
-            Rm = np.array(Rm).reshape(R_P.shape); Zm = np.array(Zm).reshape(R_P.shape)
+            ax = axes[i]
+            # 向量化计算网格点，彻底替换缓慢的双层 for 循环
+            rg = self.compute_geometry(x_core, R_P.flatten(), T_P.flatten(), zv)
+            Rm = (rg[0] * self.R0_phys).reshape(R_P.shape)
+            Zm = (rg[1] * self.R0_phys).reshape(R_P.shape)
+            
             ax.tripcolor(Rm.flatten(), Zm.flatten(), PSI_P.flatten(), shading='gouraud', cmap='magma', alpha=0.9)
             
             for r_lev in [0.2, 0.4, 0.6, 0.8, 1.0]:
-                rl, zl = self.compute_geometry(x_core, r_lev, np.linspace(0, 2*np.pi, 100), zv)[:2]
+                rl, zl = self.compute_geometry(x_core, np.full(100, r_lev), np.linspace(0, 2*np.pi, 100), zv)[:2]
                 ax.plot(rl * self.R0_phys, zl * self.R0_phys, color='white', lw=1.0, alpha=0.5)
             
             th_t = np.linspace(0, 2*np.pi, 200)
             ax.plot(10 - np.cos(th_t) - 0.3*np.cos(th_t+zv), np.sin(th_t) - 0.3*np.sin(th_t+zv), 'r--', lw=1.5, label='Input LCFS')
             
-            rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
+            rl_e, zl_e = self.compute_geometry(x_core, np.full(100, 1.0), np.linspace(0, 2*np.pi, 100), zv)[:2]
             ax.plot(rl_e * self.R0_phys, zl_e * self.R0_phys, color='#FFD700', lw=2.0, label='Solved Boundary')
             ax.set_aspect('equal'); ax.set_title(f'Toroidal Angle $\zeta={zv:.2f}$') 
             if i == 0: ax.legend(loc='upper right', fontsize='xx-small')
