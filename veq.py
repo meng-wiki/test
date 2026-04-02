@@ -57,8 +57,48 @@ class VEQ3D_Solver:
         self.RHO, self.TH, self.ZE = np.meshgrid(self.rho, self.theta, self.zeta, indexing='ij')
         self.weights_3d = self.rho_weights[:, None, None]
 
+        self._precompute_radial_factors() # 预计算固定网格相关的常量
         self._build_basis_matrices()
         self.fit_boundary()
+
+    def _precompute_radial_factors(self):
+        """预计算与网格相关、与参数无关的 Chebyshev 和各种修正因子，避免 JAX 中重复构造"""
+        x = 2.0 * self.rho**2 - 1.0
+        T_list = []
+        dTdx_list = []
+        if self.L_rad > 0:
+            T_list.append(np.ones_like(x))
+            dTdx_list.append(np.zeros_like(x))
+        if self.L_rad > 1:
+            T_list.append(x)
+            dTdx_list.append(np.ones_like(x))
+        for l in range(2, self.L_rad):
+            T_new = 2.0 * x * T_list[l-1] - T_list[l-2]
+            dTdx_new = 2.0 * T_list[l-1] + 2.0 * x * dTdx_list[l-1] - dTdx_list[l-2]
+            T_list.append(T_new)
+            dTdx_list.append(dTdx_new)
+            
+        self.T = np.stack(T_list, axis=0) if self.L_rad > 0 else np.empty((0,) + x.shape)
+        self.dTdx = np.stack(dTdx_list, axis=0) if self.L_rad > 0 else np.empty((0,) + x.shape)
+        
+        self.fac_rad = (1.0 - self.rho**2) * self.T
+        self.dfac_rad = -2.0 * self.rho * self.T + 4.0 * self.rho * (1.0 - self.rho**2) * self.dTdx
+        
+        self.fac_lam_eval = (1.0 - self.rho**2)**2 * self.T
+        self.fac_lam_proj = (1.0 - self.rho**2) * self.T
+
+        if self.len_lam > 0:
+            lam_m_vals = np.array([m for m, n in self.lambda_modes])
+            self.rho_m_lam = self.rho[None, :] ** lam_m_vals[:, None]
+        else:
+            self.rho_m_lam = np.array([])
+            
+        if self.len_2d > 0:
+            m_vals_2d = np.array([m for m, n, typ in self.modes_2d])
+            n_vals_2d = np.array([n for m, n, typ in self.modes_2d])
+            self.reg_weight_2d = np.sqrt(1e-6 * (m_vals_2d**2 + n_vals_2d**2))
+        else:
+            self.reg_weight_2d = np.array([])
 
     def _setup_modes(self):
         self.len_1d = 1 + 2 * self.N_tor
@@ -227,20 +267,33 @@ class VEQ3D_Solver:
         self.p_edge = res.x
 
     def _build_jax_residual_fn(self, pressure_scale_factor=1.0):
+        # 将大量常量捕获为 JAX 数组，避免内部重复组装图节点
         RHO = jnp.array(self.RHO)
         TH = jnp.array(self.TH)
         ZE = jnp.array(self.ZE)
         rho_1d = jnp.array(self.rho)
         D_matrix = jnp.array(self.D_matrix)
-        basis_1d_val = jnp.array(self.basis_1d_val)
-        basis_1d_dz = jnp.array(self.basis_1d_dz)
+        
+        # 抓取缓存好的解析预计算量
+        fac_rad = jnp.array(self.fac_rad)
+        dfac_rad = jnp.array(self.dfac_rad)
+        fac_lam_eval = jnp.array(self.fac_lam_eval)
+        fac_lam_proj = jnp.array(self.fac_lam_proj)
+        rho_m_lam = jnp.array(self.rho_m_lam)
+        reg_weight_2d = jnp.array(self.reg_weight_2d)
+
+        basis_1d_val_slice = jnp.array(self.basis_1d_val[:, 0, 0, :])
+        basis_1d_dz_slice = jnp.array(self.basis_1d_dz[:, 0, 0, :])
+        
         basis_2d_val = jnp.array(self.basis_2d_val)
         basis_2d_dr = jnp.array(self.basis_2d_dr)
         basis_2d_dth = jnp.array(self.basis_2d_dth)
         basis_2d_dze = jnp.array(self.basis_2d_dze)
-        basis_lam_val = jnp.array(self.basis_lam_val)
-        basis_lam_dth = jnp.array(self.basis_lam_dth)
-        basis_lam_dze = jnp.array(self.basis_lam_dze)
+        
+        basis_lam_tz = jnp.array(self.basis_lam_val[:, 0, :, :])
+        basis_lam_dth = jnp.array(self.basis_lam_dth[:, 0, :, :])
+        basis_lam_dze = jnp.array(self.basis_lam_dze[:, 0, :, :])
+        
         k_th = jnp.array(self.k_th)
         k_ze = jnp.array(self.k_ze)
         weights_3d = jnp.array(self.weights_3d)
@@ -256,19 +309,6 @@ class VEQ3D_Solver:
         Phi_a = self.Phi_a
         dtheta = self.dtheta
         dzeta = self.dzeta
-
-        if self.len_lam > 0:
-            lam_m_vals = jnp.array([m for m, n in self.lambda_modes])
-        else:
-            lam_m_vals = jnp.array([])
-
-        # --- 为新增正则化预计算模式惩罚权重 ---
-        if self.len_2d > 0:
-            m_vals_2d = jnp.array([m for m, n, typ in self.modes_2d])
-            n_vals_2d = jnp.array([n for m, n, typ in self.modes_2d])
-            # 正则化机制 1 权重：为避免与边界形变发生拉扯冲突，将基础权重下调到 1e-6，
-            # 并乘以 (m^2+n^2) 迫使高频模式尽量压缩。
-            reg_weight_2d = jnp.sqrt(1e-6 * (m_vals_2d**2 + n_vals_2d**2))
             
         def jax_unpack_edge(p):
             idx = 2
@@ -295,53 +335,30 @@ class VEQ3D_Solver:
             return jnp.real(jnp.fft.ifft(1j * k_ze * jnp.fft.fft(f, axis=2), axis=2))
 
         def jax_res_fn(x_core, apply_scaling=True):
-            x = 2.0 * rho_1d**2 - 1.0
-            
-            T_list = []
-            dTdx_list = []
-            if L_rad > 0:
-                T_list.append(jnp.ones_like(x))
-                dTdx_list.append(jnp.zeros_like(x))
-            if L_rad > 1:
-                T_list.append(x)
-                dTdx_list.append(jnp.ones_like(x))
-            for l in range(2, L_rad):
-                T_new = 2.0 * x * T_list[l-1] - T_list[l-2]
-                dTdx_new = 2.0 * T_list[l-1] + 2.0 * x * dTdx_list[l-1] - dTdx_list[l-2]
-                T_list.append(T_new)
-                dTdx_list.append(dTdx_new)
-                
-            T = jnp.stack(T_list, axis=0) if L_rad > 0 else jnp.empty((0,) + x.shape)
-            dTdx = jnp.stack(dTdx_list, axis=0) if L_rad > 0 else jnp.empty((0,) + x.shape)
-            
-            fac_rad = (1.0 - rho_1d**2) * T
-            dfac_rad = -2.0 * rho_1d * T + 4.0 * rho_1d * (1.0 - rho_1d**2) * dTdx
-            
             e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
             c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
 
+            # 使用 jnp.dot 重写以避免复杂的 einsum，这相当于高速的 GEMM 运算
             def eval_1d(c_e, c_c):
                 core_contrib = jnp.dot(c_c.T, fac_rad)  
                 ce_eff = c_e[:, None] + core_contrib    
-                b_val = basis_1d_val[:, 0, 0, :]        
-                b_dz  = basis_1d_dz[:, 0, 0, :]         
-                val = jnp.einsum('mr,mz->rz', ce_eff, b_val)[:, None, :] 
-                dz  = jnp.einsum('mr,mz->rz', ce_eff, b_dz)[:, None, :]  
+                val = jnp.dot(ce_eff.T, basis_1d_val_slice)[:, None, :] 
+                dz  = jnp.dot(ce_eff.T, basis_1d_dz_slice)[:, None, :]  
                 dr_contrib = jnp.dot(c_c.T, dfac_rad)   
-                dr  = jnp.einsum('mr,mz->rz', dr_contrib, b_val)[:, None, :]
+                dr  = jnp.dot(dr_contrib.T, basis_1d_val_slice)[:, None, :]
                 return val, dr, dz
 
+            # 使用带广播维度的 sum 替换复杂的 einsum
             def eval_2d(c_e, c_c):
                 if len_2d == 0: 
                     return 0.0, 0.0, 0.0, 0.0
                 core_contrib = jnp.dot(c_c.T, fac_rad)  
                 ce_eff = c_e[:, None] + core_contrib    
-                val = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_val)
-                dth = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dth)
-                dz  = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dze)
+                val = jnp.sum(ce_eff[:, :, None, None] * basis_2d_val, axis=0)
+                dth = jnp.sum(ce_eff[:, :, None, None] * basis_2d_dth, axis=0)
+                dz  = jnp.sum(ce_eff[:, :, None, None] * basis_2d_dze, axis=0)
                 dr_contrib = jnp.dot(c_c.T, dfac_rad)   
-                dr = jnp.einsum('mr,mrtz->rtz', dr_contrib, basis_2d_val) + \
-                     jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dr)
+                dr = jnp.sum(dr_contrib[:, :, None, None] * basis_2d_val + ce_eff[:, :, None, None] * basis_2d_dr, axis=0)
                 return val, dr, dth, dz
 
             c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
@@ -381,13 +398,9 @@ class VEQ3D_Solver:
             g_rt, g_rz, g_tz = Rr*Rt+Zr*Zt, Rr*Rz+Zr*Zz, Rt*Rz+Zt*Zz
 
             if len_lam > 0:
-                rho_m_lam = rho_1d[None, :] ** lam_m_vals[:, None] 
-                lam_ce = jnp.dot(c_lam.T, T) * rho_m_lam * (1.0 - rho_1d**2)**2
-                
-                b_dth = basis_lam_dth[:, 0, :, :]    
-                b_dze = basis_lam_dze[:, 0, :, :]    
-                Lt = jnp.einsum('mr,mtz->rtz', lam_ce, b_dth)
-                Lz = jnp.einsum('mr,mtz->rtz', lam_ce, b_dze)
+                lam_ce = jnp.dot(c_lam.T, fac_lam_eval) * rho_m_lam
+                Lt = jnp.einsum('mr,mtz->rtz', lam_ce, basis_lam_dth)
+                Lz = jnp.einsum('mr,mtz->rtz', lam_ce, basis_lam_dze)
             else:
                 Lt = 0.0
                 Lz = 0.0
@@ -431,84 +444,56 @@ class VEQ3D_Solver:
             term5 = GZ * (-a * RHO * jnp.sin(thZ)) * vol_w
             term6 = (GR * (h + RHO * jnp.cos(thR)) + GZ * (v - k * RHO * jnp.sin(thZ))) * vol_w
             
-            basis_1d_tz = basis_1d_val[:, 0, 0, :]
-            
-            def integ_1d(term):
-                term_t = jnp.sum(term, axis=1) 
-                term_tz = jnp.dot(term_t, basis_1d_tz.T) 
-                return jnp.dot(fac_rad, term_tz) 
-                
-            res1 = integ_1d(term1)
-            res2 = integ_1d(term2)
-            res3 = integ_1d(term3)
-            res4 = integ_1d(term4)
-            res5 = integ_1d(term5)
-            res6 = integ_1d(term6)
-            
-            geom_res_list = [res1, res2, res3, res4, res5, res6]
+            # --- 重构的高效组装块：直接批处理模态投影 ---
+            # 直接沿着0轴堆叠所有项，一次性完成计算，极大降低了计算图节点数量
+            terms_1d = jnp.stack([term1, term2, term3, term4, term5, term6], axis=0) # [6, Nr, Nt, Nz]
+            terms_1d_t = jnp.sum(terms_1d, axis=2) # 沿 theta(axis=2) 积分
+            terms_1d_tz = jnp.einsum('vrz,mz->vrm', terms_1d_t, basis_1d_val_slice) # 沿 zeta 投影
+            res_1d = jnp.einsum('lr,vrm->lvm', fac_rad, terms_1d_tz).reshape((L_rad, 6 * len_1d)) # 沿 rho 投影
             
             if len_2d > 0:
                 term7 = GR * (-a * RHO * jnp.sin(thR)) * vol_w
                 term8 = GZ * (-a * k * RHO * jnp.cos(thZ)) * vol_w
+                terms_2d = jnp.stack([term7, term8], axis=0)
+                terms_2d_r = jnp.einsum('vrtz,mrtz->vmr', terms_2d, basis_2d_val)
+                res_2d = jnp.einsum('lr,vmr->lvm', fac_rad, terms_2d_r).reshape((L_rad, 2 * len_2d))
+                res_geom = jnp.concatenate([res_1d, res_2d], axis=1).flatten()
+            else:
+                res_geom = res_1d.flatten()
                 
-                def integ_2d(term):
-                    term_r = jnp.einsum('rtz,mrtz->mr', term, basis_2d_val) 
-                    return jnp.dot(fac_rad, term_r.T) 
-                    
-                geom_res_list.append(integ_2d(term7))
-                geom_res_list.append(integ_2d(term8))
-                
-            res_geom_concat = jnp.concatenate(geom_res_list, axis=1)
-            final_res_list = [res_geom_concat.flatten()]
+            res_list = [res_geom]
             
             if len_lam > 0:
                 term_lam = Jr_phys * vol_w
-                basis_lam_tz = basis_lam_val[:, 0, :, :]
-                term_lam_tz = jnp.tensordot(term_lam, basis_lam_tz, axes=([1, 2], [1, 2])) 
-                
-                fac_lam = (1.0 - rho_1d**2) * T
-                res_lam = jnp.dot(fac_lam, rho_m_lam.T * term_lam_tz)
-                final_res_list.append(res_lam.flatten())
+                term_lam_tz = jnp.einsum('rtz,mtz->rm', term_lam, basis_lam_tz) 
+                res_lam = jnp.dot(fac_lam_proj, rho_m_lam.T * term_lam_tz)
+                res_list.append(res_lam.flatten())
                 
             # =======================================================
             # [解耦修改 1]：组装基础物理残差并进行物理缩放与屏障惩罚
             # =======================================================
-            phys_res = jnp.concatenate(final_res_list)
+            phys_res = jnp.concatenate(res_list)
 
             if apply_scaling:
                 phys_res = phys_res / res_scales
                 
-            # 防坐标系自交/折叠的屏障惩罚 (必须且仅能应用于物理残差，防止引发优化器作弊)
+            # 防坐标系自交/折叠的屏障惩罚
             penalty = jnp.sum(jnp.where(det_phys < 1e-5, 100.0 * (1e-5 - det_phys)**2, 0.0))
             phys_res = phys_res * (1.0 + penalty)  
                 
             # =======================================================
-            # [解耦修改 2]：非线性纯净物理正则化约束扩展 (独立拼接)
+            # [解耦修改 2]：非线性纯净物理正则化约束扩展
             # =======================================================
-            reg_residuals = []
+            final_res_list = [phys_res]
             
-            # [机制 1] 谱压缩正则化：惩罚 tR 和 tZ
-            # 迫使优化器在等效物理场中寻找一个高频分量最小的平滑 theta 坐标映射
             if len_2d > 0:
-                # 给 t_R 和 t_Z 的每个系数独立乘以 sqrt(权重) (此时权重自身已经是无量纲合理的量级)
-                reg_tR = (c_tR * reg_weight_2d[None, :]).flatten()
-                reg_tZ = (c_tZ * reg_weight_2d[None, :]).flatten()
-                reg_residuals.extend([reg_tR, reg_tZ])
+                final_res_list.append((c_tR * reg_weight_2d[None, :]).flatten())
+                final_res_list.append((c_tZ * reg_weight_2d[None, :]).flatten())
                 
-            # [机制 2] 流函数 Lambda 绝对最小化
-            # 通过 1e-6 的极小二次惩罚防止无意义的 Lambda 分支漂移
             if len_lam > 0:
-                reg_lam = (c_lam * jnp.sqrt(1e-6)).flatten()
-                reg_residuals.append(reg_lam)
+                final_res_list.append((c_lam * jnp.sqrt(1e-6)).flatten())
                 
-            # 将缩放后的物理残差和正则化辅助残差直接平级合并 (构建最终无量纲的超定系统)
-            # 注意：正则项不参与 res_scales 的缩放，也不参与坐标壁垒 penalty 的乘法作弊。
-            if reg_residuals:
-                final_res = jnp.concatenate([phys_res] + reg_residuals)
-            else:
-                final_res = phys_res
-
-            return final_res
+            return jnp.concatenate(final_res_list)
             
         return jax_res_fn
 
@@ -558,7 +543,6 @@ class VEQ3D_Solver:
     def solve(self):
         print(">>> 启动 VEQ-3D 谱精度平衡求解器 (网格-压力双重延拓完美版)...")
         
-        # 动态计算不同阶段的安全网格尺寸
         def make_even(x): return x + (x % 2)
         c_Nr = make_even(max(8, 4 * self.L_rad + 2))
         c_Nt = make_even(max(12, 4 * self.M_pol + 4))
@@ -574,7 +558,6 @@ class VEQ3D_Solver:
         self.update_grid(c_Nr, c_Nt, c_Nz)
         x_guess = np.zeros(self.num_core_params)
         
-        # 放开探索步数至 200，在低分辨率下计算极快，不会耽误时间
         res_phase1 = self._run_optimization(x_guess, max_nfev=200, ftol=1e-3, pressure_scale_factor=0.0)
 
         print("\n" + "="*70)
@@ -648,7 +631,6 @@ class VEQ3D_Solver:
         return R, Z, thR, thZ, a, k, lam
 
     def print_final_parameters(self, x_core):
-        # 动态计算表格排版所需的总宽度 (基础宽度46 + 每一阶L需要25个字符)
         table_width = max(110, 46 + self.L_rad * 25)
         
         print("\n" + "=" * table_width)
@@ -672,7 +654,6 @@ class VEQ3D_Solver:
             print(h_str)
             idx = 1
             for n in range(1, self.N_tor + 1):
-                # 修复了 f-string 嵌套对齐问题
                 c_str = f"{f'{name}{n}c':<15} | {e_arr[idx]:>25.8e} | " + " | ".join([f"{c_arr[L, idx]:>22.8e}" for L in range(self.L_rad)])
                 print(c_str)
                 s_str = f"{f'{name}{n}s':<15} | {e_arr[idx+1]:>25.8e} | " + " | ".join([f"{c_arr[L, idx+1]:>22.8e}" for L in range(self.L_rad)])
@@ -687,7 +668,6 @@ class VEQ3D_Solver:
             print("-" * table_width)
             print(">>> 极向高阶摄动分量 (theta_R & theta_Z) [受谱压缩正则化约束]:")
             for i, (m, n, typ) in enumerate(self.modes_2d):
-                # 修复了变量名长度变化导致的列错位
                 tR_str = f"{f'tR_{m}_{n}{typ}':<15} | {e_tR[i]:>25.8e} | " + " | ".join([f"{c_tR[L, i]:>22.8e}" for L in range(self.L_rad)])
                 print(tR_str)
             for i, (m, n, typ) in enumerate(self.modes_2d):
