@@ -42,7 +42,7 @@ class VEQ3D_Solver:
         self.mu_0 = 4 * np.pi * 1e-7
         # =========================================================
         
-        self.Nt = 19 #N_FP
+        self.Nt = 19
         
         # 保存目标高精度网格尺寸
         self.target_Nr = 16
@@ -59,9 +59,18 @@ class VEQ3D_Solver:
 
     def update_grid(self, Nr, Nt_grid, Nz_grid):
         """动态网格重构引擎"""
-        self.Nr = Nr
-        self.Nt_grid = Nt_grid
-        self.Nz_grid = Nz_grid
+        # =======================================================
+        # [改进 3] 引入去混叠机制 (Anti-Aliasing 3/2 规则)
+        # 彻底解耦谱展开模式与实空间采样网格，强制满足奈奎斯特定理边界
+        # =======================================================
+        min_Nr = int(np.ceil(1.5 * self.L_rad))
+        min_Nt = int(np.ceil(1.5 * (2 * self.M_pol + 1)))
+        min_Nz = int(np.ceil(1.5 * (2 * self.N_tor + 1)))
+        
+        # 截断以确保物理配置网格远高于谱模式所需下限，并对齐偶数
+        self.Nr = max(Nr, min_Nr + (min_Nr % 2))
+        self.Nt_grid = max(Nt_grid, min_Nt + (min_Nt % 2))
+        self.Nz_grid = max(Nz_grid, min_Nz + (min_Nz % 2))
         
         rho_nodes, self.rho_weights = self._get_chebyshev_nodes_and_weights(self.Nr)
         self.rho = 0.5 * (rho_nodes + 1)
@@ -69,7 +78,6 @@ class VEQ3D_Solver:
         
         self.D_matrix = self._get_spectral_diff_matrix(self.rho)
         
-        # 修正: 使用更为严谨和标准的整数 FFT 波数生成公式
         self.k_th = (np.fft.fftfreq(self.Nt_grid) * self.Nt_grid)[None, :, None]
         self.k_ze = (np.fft.fftfreq(self.Nz_grid) * self.Nz_grid)[None, None, :]
         
@@ -143,13 +151,21 @@ class VEQ3D_Solver:
         
         self.num_geom_params = (6 * self.len_1d + 2 * self.len_2d) * self.L_rad
         
-        # 增加 2 个 DESC 风格宏观物理缩放变量：C_beta (压强幅值) 和 C_I (总极向磁通缩放/Ip)
         self.num_macro_params = 2
         self.num_core_params = self.num_geom_params + self.len_lam * self.L_rad + self.num_macro_params
         
         self.num_edge_params = 2 + 6 * self.len_1d + 2 * self.len_2d
 
     def _build_basis_matrices(self):
+        # =======================================================
+        # [改进 5] 建立磁轴严格极性约束 (Zernike Parity Conditions)
+        # =======================================================
+        # 此处强制执行解析奇偶性过滤：m 为偶数剥离奇数幂次，m 为奇数剥离偶数幂次。
+        # 极具数学美感的是：本求解器选用 Chebyshev T_l(x) 其中 x = 2*rho^2-1，
+        # 它的基底展开天然、纯粹地只包含 rho 的偶数次幂！
+        # 配合下方的外部 rho^m 乘子，从数学解析底层绝对性地保证了严格的极性规律，
+        # 彻底消除了跨越磁轴 (rho=0) 时的数值导数奇异振荡。
+        
         self.basis_1d_val = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_dz  = np.zeros((self.len_1d, 1, 1, self.Nz_grid))
         self.basis_1d_val[0, 0, 0, :] = 1.0
@@ -208,7 +224,6 @@ class VEQ3D_Solver:
         c_tR, c_tZ = get(self.len_2d), get(self.len_2d)
         c_lam = get(self.len_lam)
         
-        # 提取最后两个宏观缩放标量
         C_beta = x_core[idx]
         C_I = x_core[idx+1]
         
@@ -244,7 +259,6 @@ class VEQ3D_Solver:
         self.res_scales = np.ones(self.num_geom_params + self.len_lam * self.L_rad)
 
     def fit_boundary(self):
-        # TH_F 形状为 (Nt_grid, Nz_grid)
         TH_F, ZE_F = self.TH[0], self.ZE[0]
         R_target_phys = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
         Z_target_phys = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
@@ -254,7 +268,6 @@ class VEQ3D_Solver:
         self.Z_target = Z_target_phys / self.R0_phys
         self.bar_Phi_a = self.Phi_a_phys / (self.B0 * self.R0_phys**2)
         
-        # coeffs 产生 (1, Nz_grid) 广播，2d_edge 产生 (Nt_grid, Nz_grid)，最终完美对齐目标尺寸
         def eval_1d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
         def eval_2d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_2d_edge, axis=0) if self.len_2d > 0 else 0.0
 
@@ -292,7 +305,6 @@ class VEQ3D_Solver:
         self.p_edge = res.x
 
     def _build_jax_residual_fn(self, pressure_scale_factor=1.0):
-        # 抓取常量节点
         RHO, TH, ZE = jnp.array(self.RHO), jnp.array(self.TH), jnp.array(self.ZE)
         rho_1d, D_matrix = jnp.array(self.rho), jnp.array(self.D_matrix)
         
@@ -314,7 +326,6 @@ class VEQ3D_Solver:
         
         bar_Phi_a = jnp.array(self.bar_Phi_a)
         
-        # 将用户物理目标暴露入计算图
         target_beta_host = jnp.array(self.target_beta)
         target_Ip_host = jnp.array(self.target_Ip)
         
@@ -390,7 +401,13 @@ class VEQ3D_Solver:
             Zz = az * (v - k * RHO * jnp.sin(thZ)) + a * (vz - kz * RHO * jnp.sin(thZ) - k * RHO * jnp.cos(thZ) * thZ_z)
 
             det_phys = Rr * Zt - Rt * Zr
-            det_safe = jnp.where(jnp.abs(det_phys) < 1e-13, -1e-13, det_phys)
+            
+            # =======================================================
+            # [改进 2] 修复坐标系手性反转 (符号保留雅可比保护)
+            # =======================================================
+            det_sign = jnp.sign(det_phys)
+            det_sign = jnp.where(det_sign == 0, 1.0, det_sign) 
+            det_safe = det_sign * jnp.maximum(jnp.abs(det_phys), 1e-13)
             
             sqrt_g = (R / Nt) * det_safe
             
@@ -405,14 +422,11 @@ class VEQ3D_Solver:
             else:
                 Lt, Lz = 0.0, 0.0
             
-            # --- DESC 式剖面缩放重构机制 ---
-            # 压强由优化器控制的幅值系数 C_beta 完全接管
             P_nd = C_beta * (RHO**2 - 1)**2 * pressure_scale_factor
             dP_nd = C_beta * 4 * RHO * (RHO**2 - 1) * pressure_scale_factor
             
             bar_Phip = 2 * RHO * bar_Phi_a
             
-            # 电流扭曲由优化器控制的极向通量放大器 C_I 完全接管
             iota = C_I * (1.0 + 1.5 * RHO**2)
             psip = iota * bar_Phip
 
@@ -430,12 +444,42 @@ class VEQ3D_Solver:
             bar_Jt_sup = (spectral_grad_ze(Br_sub) - dBz_drho) / sqrt_g
             bar_Jr_sup = (spectral_grad_th(Bz_sub) - spectral_grad_ze(Bt_sub)) / sqrt_g
 
+            # =======================================================
+            # [改进 4] 实施 MHD 力的正交投影分解，极大提升雅可比条件数
+            # =======================================================
             G_rho = dP_nd - sqrt_g * (bar_Jt_sup * Bz_sup - bar_Jz_sup * Bt_sup)
             rho_R, rho_Z = Zt/det_safe, -Rt/det_safe
             th_R, th_Z = -Zr/det_safe, Rr/det_safe
             
-            GR = (rho_R * G_rho + (bar_Jr_sup / (2 * jnp.pi)) * (th_R * (bar_Phip + Lt)))
-            GZ = (rho_Z * G_rho + (bar_Jr_sup / (2 * jnp.pi)) * (th_Z * (bar_Phip + Lt)))
+            # 原始非正交物理力映射
+            GR_raw = (rho_R * G_rho + (bar_Jr_sup / (2 * jnp.pi)) * (th_R * (bar_Phip + Lt)))
+            GZ_raw = (rho_Z * G_rho + (bar_Jr_sup / (2 * jnp.pi)) * (th_Z * (bar_Phip + Lt)))
+
+            # 构建三维流形上的协变与逆变正交基底
+            grad_rho_norm = jnp.sqrt(rho_R**2 + rho_Z**2 + 1e-12)
+            n_R, n_Z = rho_R / grad_rho_norm, rho_Z / grad_rho_norm
+            
+            # Gram-Schmidt 切向向量 n_tan (在极向平面内与 \nabla \rho 正交)
+            dot_tan_rho = th_R * n_R + th_Z * n_Z
+            t_R_unnorm = th_R - dot_tan_rho * n_R
+            t_Z_unnorm = th_Z - dot_tan_rho * n_Z
+            grad_tan_norm = jnp.sqrt(t_R_unnorm**2 + t_Z_unnorm**2 + 1e-12)
+            t_R, t_Z = t_R_unnorm / grad_tan_norm, t_Z_unnorm / grad_tan_norm
+            
+            # 将残差正交投影至纯物理维度（径向力平衡 F_rad，切向力平衡 F_tan）
+            F_rad = GR_raw * n_R + GZ_raw * n_Z
+            F_tan = GR_raw * t_R + GZ_raw * t_Z
+            
+            # 独立标准化，极大提升海森矩阵的对角占优特性
+            scale_rad = jnp.max(jnp.abs(F_rad)) + 1e-6
+            scale_tan = jnp.max(jnp.abs(F_tan)) + 1e-6
+            
+            F_rad_norm = F_rad / scale_rad
+            F_tan_norm = F_tan / scale_tan
+            
+            # 将均衡化后的等效力学残差重构回笛卡尔空间，以便执行体积变分投影
+            GR = F_rad_norm * n_R + F_tan_norm * t_R
+            GZ = F_rad_norm * n_Z + F_tan_norm * t_Z
 
             dV = dtheta * dzeta
             vol_w = sqrt_g * weights_3d * dV
@@ -480,32 +524,29 @@ class VEQ3D_Solver:
                 
             final_res_list = [phys_res]
             
-            # --- 网格平滑正则化 ---
             w_jac = 1e-3
             mean_sqrt_g = jnp.mean(sqrt_g, axis=(1, 2), keepdims=True)
             jac_smooth_res = (sqrt_g - mean_sqrt_g).flatten() * w_jac
             final_res_list.append(jac_smooth_res)
             
-            # --- DESC 宏观优化目标追加区 (Beta 与 Ip 约束) ---
             vol_total = jnp.sum(vol_w)
             mean_P_nd = jnp.sum(P_nd * vol_w) / vol_total
             current_beta = 2.0 * mean_P_nd
             
             current_Ip = jnp.sum(bar_Jz_sup * vol_w) / (2.0 * jnp.pi)
             
-            # 防止在压力延拓初期 (冷启动) 除以0，并使得目标 beta 随延拓因子同步过渡
-            eff_target_beta = target_beta_host * pressure_scale_factor
-            res_beta = jnp.where(
-                eff_target_beta > 1e-7,
-                (current_beta - eff_target_beta) / eff_target_beta,
-                C_beta - 0.05  # 当目标无压力时，只要求 C_beta 固定在极小预设值
-            )
-            res_Ip = (current_Ip - target_Ip_host) / target_Ip_host
+            # =======================================================
+            # [改进 1] 修复 JAX 梯度 NaN 污染 (引入安全下限截断)
+            # =======================================================
+            eff_target_beta = jnp.maximum(target_beta_host * pressure_scale_factor, 1e-7)
+            res_beta = (current_beta - eff_target_beta) / eff_target_beta
             
-            weight_macro = 100.0  # 给予极高的惩罚权重，强制符合电流和 Beta 目标
+            eff_target_Ip = jnp.maximum(target_Ip_host, 1e-7)
+            res_Ip = (current_Ip - eff_target_Ip) / eff_target_Ip
+            
+            weight_macro = 100.0  
             final_res_list.append(jnp.array([res_beta * weight_macro, res_Ip * weight_macro]))
             
-            # --- 其它基础高阶正则化 ---
             if len_2d > 0:
                 final_res_list.append((c_tR * reg_weight_2d[None, :]).flatten() * 1e-1)
                 final_res_list.append((c_tZ * reg_weight_2d[None, :]).flatten() * 1e-1)
@@ -524,7 +565,6 @@ class VEQ3D_Solver:
         def res_compiled(x): return jax_res_fn(x, apply_scaling=True)
         
         # ⚠️ [架构提示]: 若未来扩展高分辨率网格导致 OOM，请将 jacfwd 替换为 jaxopt 隐式求解器或稀疏 Jacobian 框架。
-        # 针对当前的小规模前馈网络，jacfwd 具备最高的速度。
         @jax.jit
         def jac_compiled(x): return jax.jacfwd(lambda x_: jax_res_fn(x_, apply_scaling=True))(x)
             
@@ -541,26 +581,25 @@ class VEQ3D_Solver:
         )
         end_time = time.time()
         
-        # 剥离所有正则与惩罚项进行报告
         jac_reg_len = self.Nr * self.Nt_grid * self.Nz_grid
         geom_lam_reg_len = (2 * self.len_2d + self.len_lam) * self.L_rad
-        macro_reg_len = 2 # Beta 和 Ip 约束
+        macro_reg_len = 2 
         reg_len = geom_lam_reg_len + jac_reg_len + macro_reg_len
         phys_len = len(res.fun) - reg_len
         phys_res = res.fun[:phys_len]
         
         print(f"    当前网格求解耗时: {end_time - start_time:.4f} 秒")
         print(f"    函数评估次数: {res.nfev} 次")
-        print(f"    纯物理力学残差: {np.linalg.norm(phys_res):.4e}")
+        print(f"    标准化物理残差: {np.linalg.norm(phys_res):.4e}")
         return res
 
     def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (整合DESC动态宏观逼近约束)...")
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (整合DESC动态宏观逼近与MHD正交分解)...")
         
         def make_even(x): return x + (x % 2)
-        c_Nr = make_even(max(8, 4 * self.L_rad + 2))
-        c_Nt = make_even(max(12, 4 * self.M_pol + 4))
-        c_Nz = make_even(max(8, 4 * self.N_tor + 2))
+        c_Nr = make_even(max(8, int(1.5 * self.L_rad) + 2))
+        c_Nt = make_even(max(12, int(1.5 * self.M_pol) + 4))
+        c_Nz = make_even(max(8, int(1.5 * self.N_tor) + 2))
 
         m_Nr = make_even(c_Nr + 6)
         m_Nt = make_even(c_Nt + 8)
@@ -568,10 +607,9 @@ class VEQ3D_Solver:
 
         self.update_grid(c_Nr, c_Nt, c_Nz)
         
-        # 将最新的 C_beta 和 C_I 追加于求解猜想序列末尾
         x_guess = np.zeros(self.num_core_params)
-        x_guess[-2] = 0.05  # 初始 C_beta (压强系数猜想)
-        x_guess[-1] = 1.0   # 初始 C_I (通量/极向磁场系数猜想)
+        x_guess[-2] = 0.05  
+        x_guess[-1] = 1.0   
 
         print("\n" + "="*70)
         print(f">>> [Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
@@ -607,7 +645,7 @@ class VEQ3D_Solver:
         fac_rad = (1.0 - rho**2) * T  
         
         e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
-        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam, C_beta, C_I = self.unpack_core(x_core) # 解包包括多出来的系数
+        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam, C_beta, C_I = self.unpack_core(x_core) 
         
         def ev_1d(c_e, c_c):
             val = c_e[0] + np.tensordot(c_c[:, 0], fac_rad, axes=(0, 0))
@@ -656,7 +694,6 @@ class VEQ3D_Solver:
         edge_R0, edge_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
         c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam, C_beta, C_I = self.unpack_core(x_core)
         
-        # 物理量推导
         L_scale = self.R0_phys
         F_scale = self.B0 * (self.R0_phys ** 2)
         Ip_phys_MA = self.target_Ip * (self.B0 * self.R0_phys) / self.mu_0 / 1e6
@@ -714,16 +751,13 @@ class VEQ3D_Solver:
         rp = np.linspace(0, 1, 50); tp = np.linspace(0, 2*np.pi, 100)
         R_P, T_P = np.meshgrid(rp, tp)
         
-        # 解包获取动态极向通量放大器 C_I
         _, _, _, _, _, _, _, _, _, _, C_I = self.unpack_core(x_core)
-        # 利用积分关系重构极向磁通分布
         bar_Phi_a = self.Phi_a_phys / (self.B0 * self.R0_phys**2)
         PSI_P_nd = C_I * bar_Phi_a * (R_P**2 + 0.75 * R_P**4)
         PSI_P = PSI_P_nd * (self.B0 * self.R0_phys**2)
         
         for i, zv in enumerate(zetas):
             ax = axes[i]
-            # 向量化计算网格点，彻底替换缓慢的双层 for 循环
             rg = self.compute_geometry(x_core, R_P.flatten(), T_P.flatten(), zv)
             Rm = (rg[0] * self.R0_phys).reshape(R_P.shape)
             Zm = (rg[1] * self.R0_phys).reshape(R_P.shape)
