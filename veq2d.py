@@ -282,7 +282,7 @@ class VEQ2D_Tokamak_Solver:
             thR = self.TH[0] + c0R_v + tR_v
             thZ = self.TH[0] + c0Z_v + tZ_v
             
-            R_mod = R0 + a_v * (h_v - np.cos(thR))
+            R_mod = R0 + a_v * (h_v + np.cos(thR))
             Z_mod = Z0 + a_v * (v_v - k_v * np.sin(thZ))
             
             res_geom = np.concatenate([(R_mod - R_target).flatten(), (Z_mod - Z_target).flatten()])
@@ -377,10 +377,10 @@ class VEQ2D_Tokamak_Solver:
             thR_r, thR_th, thR_z = c0Rr + tRr, 1.0 + tRth, c0Rz + tRz
             thZ_r, thZ_th, thZ_z = c0Zr + tZr, 1.0 + tZth, c0Zz + tZz
             
-            R = e_R0 + a * (h - RHO * jnp.cos(thR))
-            Rr = ar * (h - RHO * jnp.cos(thR)) + a * (hr - jnp.cos(thR) + RHO * jnp.sin(thR) * thR_r)
-            Rt = a * RHO * jnp.sin(thR) * thR_th
-            Rz = az * (h - RHO * jnp.cos(thR)) + a * (hz + RHO * jnp.sin(thR) * thR_z)
+            R = e_R0 + a * (h + RHO * jnp.cos(thR))
+            Rr = ar * (h + RHO * jnp.cos(thR)) + a * (hr + jnp.cos(thR) - RHO * jnp.sin(thR) * thR_r)
+            Rt = -a * RHO * jnp.sin(thR) * thR_th
+            Rz = az * (h + RHO * jnp.cos(thR)) + a * (hz - RHO * jnp.sin(thR) * thR_z)
             
             Z = e_Z0 + a * (v - k * RHO * jnp.sin(thZ))
             Zr = ar * (v - k * RHO * jnp.sin(thZ)) + a * (vr - kr * RHO * jnp.sin(thZ) - k * jnp.sin(thZ) - k * RHO * jnp.cos(thZ) * thZ_r)
@@ -432,12 +432,12 @@ class VEQ2D_Tokamak_Solver:
             GR_w = (Zt * F_rho - Zr * F_beta) * metric_w
             GZ_w = (-Rt * F_rho + Rr * F_beta) * metric_w
             
-            term1 = GR_w * (a * RHO * jnp.sin(thR))
+            term1 = GR_w * (-a * RHO * jnp.sin(thR))
             term2 = GZ_w * (-a * k * RHO * jnp.cos(thZ))
             term3 = GR_w * a
             term4 = GZ_w * a
             term5 = GZ_w * (-a * RHO * jnp.sin(thZ))
-            term6 = GR_w * (h - RHO * jnp.cos(thR)) + GZ_w * (v - k * RHO * jnp.sin(thZ))
+            term6 = GR_w * (h + RHO * jnp.cos(thR)) + GZ_w * (v - k * RHO * jnp.sin(thZ))
             
             terms_1d = jnp.stack([term1, term2, term3, term4, term5, term6], axis=0) 
             terms_1d_t = jnp.sum(terms_1d, axis=2) 
@@ -445,7 +445,7 @@ class VEQ2D_Tokamak_Solver:
             res_1d = jnp.einsum('lr,vrm->lvm', fac_rad, terms_1d_tz).reshape((L_rad, 6 * len_1d)) 
             
             if len_2d > 0:
-                term7 = GR_w * (a * RHO * jnp.sin(thR))
+                term7 = GR_w * (-a * RHO * jnp.sin(thR))
                 term8 = GZ_w * (-a * k * RHO * jnp.cos(thZ))
                 terms_2d = jnp.stack([term7, term8], axis=0)
                 terms_2d_r = jnp.einsum('vrtz,mrtz->vmr', terms_2d, basis_2d_val)
@@ -586,7 +586,7 @@ class VEQ2D_Tokamak_Solver:
         
         thR, thZ = theta + c0R + tR, theta + c0Z + tZ
         
-        R = e_R0 + a * (h - rho * np.cos(thR))
+        R = e_R0 + a * (h + rho * np.cos(thR))
         Z = e_Z0 + a * (v - k * rho * np.sin(thZ))
         
         lam = np.zeros_like(base_grid)
