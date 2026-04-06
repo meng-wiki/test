@@ -468,7 +468,7 @@ class VEQ2D_Tokamak_Solver:
             if apply_scaling:
                 phys_res = phys_res / res_scales
                 
-            penalty_res = jnp.where(det_phys > 1e-6, 1e4 * (det_phys - 1e-6), 0.0).flatten()
+            penalty_res = jnp.where(det_phys < 1e-6, 1e4 * (1e-6 - det_phys), 0.0).flatten()
                 
             final_res_list = [phys_res, penalty_res]
             
@@ -527,12 +527,12 @@ class VEQ2D_Tokamak_Solver:
         c_Nz = 1  # 2D 必须为 1
 
         print("\n" + "="*70)
-        print(f">>> [Phase 1/2]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
+        print(f">>> [Phase 1/2]: 近似全压预收敛 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=1.0)")
         print("="*70)
         self.update_grid(c_Nr, c_Nt, c_Nz)
         x_guess = np.zeros(self.num_core_params)
         
-        res_phase1 = self._run_optimization(x_guess, max_nfev=150, ftol=1e-3, pressure_scale_factor=0.0)
+        res_phase1 = self._run_optimization(x_guess, max_nfev=150, ftol=1e-4, pressure_scale_factor=1.0)
 
         print("\n" + "="*70)
         print(f">>> [Phase 2/2]: 高保真网格 & 全物理极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz}, P=1.0)")
