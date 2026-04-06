@@ -521,25 +521,33 @@ class VEQ2D_Tokamak_Solver:
 
     def solve(self):
         print(">>> 启动 VEQ-2D 托卡马克谱平衡求解器 (完全对接 DESC Json 数据)...")
-        
-        def make_even(x): return x + (x % 2)
-        c_Nr = make_even(max(10, 4 * self.L_rad + 2))
-        c_Nt = make_even(max(12, 4 * self.M_pol + 4))
-        c_Nz = 1  # 2D 必须为 1
 
+        # ======================================================================
+        # [Phase 1/2]: 全压预收敛 (固定高保真网格，防止混叠震荡)
+        # ======================================================================
+        # 必须满足 Nyquist 定理，Nr > 2*L, Nt > 2*M，所以 42x36 是安全的抗混叠网格
+        c_Nr, c_Nt = 42, 36  
+        c_Nz = 1
+        
         print("\n" + "="*70)
-        print(f">>> [Phase 1/2]: 近似全压预收敛 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=1.0)")
+        print(f">>> [Phase 1/2]: 密网格全压预收敛 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=1.0)")
         print("="*70)
         self.update_grid(c_Nr, c_Nt, c_Nz)
+        
         x_guess = np.zeros(self.num_core_params)
         
-        res_phase1 = self._run_optimization(x_guess, max_nfev=150, ftol=1e-4, pressure_scale_factor=1.0)
+        # 第一阶段：较松的容差，让优化器快速找到宏观力平衡区间
+        res_phase1 = self._run_optimization(x_guess, max_nfev=150, ftol=1e-3, pressure_scale_factor=1.0)
 
+        # ======================================================================
+        # [Phase 2/2]: 全物理极限收敛 (保持相同网格，收紧容差)
+        # ======================================================================
         print("\n" + "="*70)
-        print(f">>> [Phase 2/2]: 高保真网格 & 全物理极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz}, P=1.0)")
+        print(f">>> [Phase 2/2]: 全物理极限精确求解 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=1.0)")
         print("="*70)
-        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
         
+        # 【关键】：千万不要再调用 self.update_grid() 改变网格，锁定积分权重！
+        # 第二阶段：极严苛的容差，压榨出 1e-11 级别的谱精度极限
         res_fine = self._run_optimization(res_phase1.x, max_nfev=500, ftol=1e-11, pressure_scale_factor=1.0)
 
         self.plot_equilibrium(res_fine.x)
