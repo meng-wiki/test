@@ -387,7 +387,8 @@ class VEQ2D_Tokamak_Solver:
             Zt = -a * k * RHO * jnp.cos(thZ) * thZ_th
             Zz = az * (v - k * RHO * jnp.sin(thZ)) + a * (vz - kz * RHO * jnp.sin(thZ) - k * RHO * jnp.cos(thZ) * thZ_z)
 
-            det_phys = Rr * Zt - Rt * Zr
+            # [修改]：翻转雅可比行列式计算公式，适配顺时针(CW)坐标映射，避免生成负面积触发天价惩罚项
+            det_phys = Rt * Zr - Rr * Zt
             sqrt_g = (R / N_fp) * det_phys 
             
             g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
