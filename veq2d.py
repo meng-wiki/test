@@ -45,22 +45,28 @@ class VEQ2D_Tokamak_Solver:
         with open(filepath, 'r') as f:
             self.demo_data = json.load(f)
             
-        self.rho_ref = np.array(self.demo_data['profiles']['rho'])
-        self.psi_ref = np.array(self.demo_data['profiles']['psi'])
-        self.q_ref = np.array(self.demo_data['profiles']['q'])
-        self.P_psi_ref = np.array(self.demo_data['profiles']['P_psi'])
+        rho_raw = np.array(self.demo_data['profiles']['rho'])
+        psi_raw = np.array(self.demo_data['profiles']['psi'])
+        q_raw = np.array(self.demo_data['profiles']['q'])
+        P_psi_raw = np.array(self.demo_data['profiles']['P_psi'])
         
-        # 使用三次样条计算 dpsi/drho
-        psi_spline = CubicSpline(self.rho_ref, self.psi_ref)
-        self.psip_ref = psi_spline(self.rho_ref, 1) # 求一阶导
+        # 使用三次样条计算 dpsi/drho (基于原始数据)
+        psi_spline = CubicSpline(rho_raw, psi_raw)
+        psip_raw = psi_spline(rho_raw, 1)
+        Phip_raw = q_raw * psip_raw
+        dP_drho_raw = P_psi_raw * psip_raw
         
-        # Phip = q * dpsi/drho (托卡马克磁流学核心关系)
-        self.Phip_ref = self.q_ref * self.psip_ref
+        # 【修复关键】：向数组头部插入 rho=0 的严格物理边界
+        self.rho_ref = np.insert(rho_raw, 0, 0.0)
+        self.psi_ref = np.insert(psi_raw, 0, 0.0)
+        self.q_ref = np.insert(q_raw, 0, q_raw[0])       # q值在轴上非零且平缓
+        self.P_psi_ref = np.insert(P_psi_raw, 0, P_psi_raw[0])
         
-        # 压力梯度 dP/drho = (dP/dpsi) * (dpsi/drho)
-        self.dP_drho_ref = self.P_psi_ref * self.psip_ref
+        self.psip_ref = np.insert(psip_raw, 0, 0.0)      # 磁通导数必须为0
+        self.Phip_ref = np.insert(Phip_raw, 0, 0.0)      # 磁通导数必须为0
+        self.dP_drho_ref = np.insert(dP_drho_raw, 0, 0.0)# 压力梯度必须为0
         
-        # 逆向积分获取实际压力 P(rho)，边界处 P(1.0) = 0
+        # 逆向积分获取实际压力 P(rho)
         self.P_ref = np.zeros_like(self.rho_ref)
         for i in range(len(self.rho_ref)-2, -1, -1):
             d_rho = self.rho_ref[i+1] - self.rho_ref[i]
@@ -84,7 +90,8 @@ class VEQ2D_Tokamak_Solver:
         self.theta = np.linspace(0, 2*np.pi, self.Nt_grid, endpoint=False)
         self.zeta = np.linspace(0, 2*np.pi, self.Nz_grid, endpoint=False)
         self.dtheta = 2 * np.pi / self.Nt_grid
-        self.dzeta = 2 * np.pi / self.Nz_grid if self.Nz_grid > 1 else 1.0 # 防止除0
+        # 【修复】：即使是 2D (Nz=1)，其环向体积跨度依然是 2*pi
+        self.dzeta = 2 * np.pi / self.Nz_grid if self.Nz_grid > 1 else 2 * np.pi 
         
         self.RHO, self.TH, self.ZE = np.meshgrid(self.rho, self.theta, self.zeta, indexing='ij')
         self.weights_3d = self.rho_weights[:, None, None]
