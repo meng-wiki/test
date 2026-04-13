@@ -6,7 +6,7 @@ import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Dict, Any
 
 # ---------------------------------------------------------------------------
 # 径向坐标 ρ（与 DESC / PEST 类 flux 坐标一致）
@@ -170,6 +170,10 @@ class VEQ3D_Solver:
         self.p_edge = None  
         # det 手性方向（+1/-1）：用于兼容输入 LCFS 与 RZ 参数化方向差异
         self.det_chirality = 1.0
+        # 线性约束 A x = b（LinearConstraintProjection）；默认无约束
+        self.linear_constraint_A = None
+        self.linear_constraint_b = None
+        self.linear_constraint_tol = 1e-10
         
         self._setup_modes()
         
@@ -372,6 +376,146 @@ class VEQ3D_Solver:
         Phip = 2 * rho * self.Phi_a
         psip = iota * Phip
         return P, dP_drho, Phip, psip
+
+    def configure_linear_constraints(self, A: Optional[np.ndarray], b: Optional[np.ndarray]):
+        """配置线性等式约束 A x = b；传 None 则清空。"""
+        if A is None or b is None:
+            self.linear_constraint_A = None
+            self.linear_constraint_b = None
+            return
+        A = np.asarray(A, dtype=float)
+        b = np.asarray(b, dtype=float).reshape(-1)
+        if A.ndim != 2 or A.shape[1] != self.num_core_params:
+            raise ValueError("A 形状必须为 (m, num_core_params)")
+        if b.shape[0] != A.shape[0]:
+            raise ValueError("b 长度必须与 A 行数一致")
+        self.linear_constraint_A = A
+        self.linear_constraint_b = b
+
+    def _linear_constraint_project(self, x_core):
+        """将 x 投影到 A x = b（最小二乘意义下最近点）。"""
+        if self.linear_constraint_A is None or self.linear_constraint_b is None:
+            return np.asarray(x_core, dtype=float)
+        A = self.linear_constraint_A
+        b = self.linear_constraint_b
+        x = np.asarray(x_core, dtype=float)
+        r = A @ x - b
+        if np.linalg.norm(r) <= self.linear_constraint_tol:
+            return x
+        AA_t = A @ A.T
+        lam, *_ = np.linalg.lstsq(AA_t, r, rcond=None)
+        return x - A.T @ lam
+
+    def _radial_integrate_forward(self, y, y0=0.0):
+        out = np.zeros_like(y, dtype=float)
+        out[0] = float(y0)
+        for i in range(1, len(y)):
+            dr = self.rho[i] - self.rho[i - 1]
+            out[i] = out[i - 1] + 0.5 * (y[i] + y[i - 1]) * dr
+        return out
+
+    def _profile_projection_data(self, x_core, pressure_scale_factor):
+        """构造 proximal 投影所需的重构剖面与目标剖面。"""
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w_tz = self.weights_3d * self.dtheta * self.dzeta
+        den = np.sum(w_tz, axis=(1, 2)) + 1e-14
+
+        dP_est = np.sum(
+            w_tz * (s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0),
+            axis=(1, 2),
+        ) / den
+        dP_tar = np.sum(w_tz * s["dP"], axis=(1, 2)) / den
+        P_tar = np.sum(w_tz * s["P"], axis=(1, 2)) / den
+
+        Phip_est_3d = 2 * np.pi * s["sqrt_g"] * s["Bz_sup"] - s["Lt"]
+        psip_est_3d = self.N_fp * (2 * np.pi * s["sqrt_g"] * s["Bt_sup"] + s["Lz"])
+        Phip_est = np.sum(w_tz * Phip_est_3d, axis=(1, 2)) / den
+        psip_est = np.sum(w_tz * psip_est_3d, axis=(1, 2)) / den
+
+        Phip_tar = np.sum(w_tz * s["Phip"], axis=(1, 2)) / den
+        psip_tar = np.sum(w_tz * s["psip"], axis=(1, 2)) / den
+
+        phi_est = self._radial_integrate_forward(Phip_est, y0=0.0)
+        psi_est = self._radial_integrate_forward(psip_est, y0=0.0)
+        phi_tar = self.Phi_a * self.rho**2
+        psi_tar = self.compute_psi(self.rho)
+
+        # 用目标轴压强作为锚点，由 dP_est 前向积分检查边界 P(1)=0 约束
+        P_est = self._radial_integrate_forward(dP_est, y0=float(P_tar[0]))
+
+        return {
+            "dP_est": dP_est,
+            "dP_tar": dP_tar,
+            "P_tar": P_tar,
+            "P_est": P_est,
+            "Phip_est": Phip_est,
+            "Phip_tar": Phip_tar,
+            "psip_est": psip_est,
+            "psip_tar": psip_tar,
+            "phi_est": phi_est,
+            "phi_tar": phi_tar,
+            "psi_est": psi_est,
+            "psi_tar": psi_tar,
+        }
+
+    def _apply_proximal_projection(self, x_core, pressure_scale_factor, projection_cfg: Optional[Dict[str, Any]] = None):
+        """非线性约束投影：匹配 Phip/psip/dP + 关键边界条件。"""
+        cfg = dict(projection_cfg or {})
+        if not bool(cfg.get("enabled", False)):
+            return np.asarray(x_core, dtype=float), {"applied": False}
+
+        strength = float(cfg.get("strength", 0.1))
+        boundary_strength = float(cfg.get("boundary_strength", 0.2))
+        anchor_weight = float(cfg.get("anchor_weight", 1e-3))
+        prox_max_nfev = int(cfg.get("prox_max_nfev", 10))
+        prox_ftol = float(cfg.get("prox_ftol", 1e-8))
+
+        x_ref = np.asarray(x_core, dtype=float).copy()
+
+        def prox_residual(x_trial):
+            d = self._profile_projection_data(x_trial, pressure_scale_factor)
+            out = []
+
+            s_p = np.sqrt(np.mean(d["Phip_tar"] ** 2)) + 1e-14
+            s_s = np.sqrt(np.mean(d["psip_tar"] ** 2)) + 1e-14
+            s_d = np.sqrt(np.mean(d["dP_tar"] ** 2)) + 1e-14
+
+            out.extend((strength * (d["Phip_est"] - d["Phip_tar"]) / s_p).tolist())
+            out.extend((strength * (d["psip_est"] - d["psip_tar"]) / s_s).tolist())
+            out.extend((strength * (d["dP_est"] - d["dP_tar"]) / s_d).tolist())
+
+            out.extend((strength * (d["phi_est"] - d["phi_tar"]) / (abs(self.Phi_a) + 1e-14)).tolist())
+            out.extend((strength * (d["psi_est"] - d["psi_tar"]) / (abs(d["psi_tar"][-1]) + 1e-14)).tolist())
+
+            out.append(boundary_strength * (d["phi_est"][-1] - self.Phi_a) / (abs(self.Phi_a) + 1e-14))
+            out.append(boundary_strength * d["psi_est"][0])
+            out.append(boundary_strength * d["P_est"][-1] / (np.sqrt(np.mean(d["P_tar"] ** 2)) + 1e-14))
+
+            if anchor_weight > 0:
+                x_scale = np.maximum(np.abs(x_ref), 1.0)
+                out.extend((np.sqrt(anchor_weight) * (x_trial - x_ref) / x_scale).tolist())
+
+            return np.asarray(out, dtype=float)
+
+        prox_res0 = prox_residual(x_ref)
+        prox_sol = least_squares(
+            prox_residual,
+            x_ref,
+            method="trf",
+            xtol=prox_ftol,
+            ftol=prox_ftol,
+            max_nfev=prox_max_nfev,
+            verbose=0,
+        )
+        x_proj = np.asarray(prox_sol.x, dtype=float)
+        prox_res1 = prox_residual(x_proj)
+        info = {
+            "applied": True,
+            "nfev": int(prox_sol.nfev),
+            "before_norm": float(np.linalg.norm(prox_res0)),
+            "after_norm": float(np.linalg.norm(prox_res1)),
+        }
+        return x_proj, info
 
     def fit_boundary(self):
         TH_F, ZE_F = self.TH[0], self.ZE[0]
@@ -668,11 +812,15 @@ class VEQ3D_Solver:
             
         return jax_res_fn
 
-    def _run_optimization(self, x0, max_nfev, ftol, pressure_scale_factor=1.0):
+    def _run_optimization(self, x0, max_nfev, ftol, pressure_scale_factor=1.0, projection_cfg: Optional[Dict[str, Any]] = None):
         # =================================================================
         # [物理闭环终极修复 3]：卸载冗余 AL 外壳，交付原生雅可比推土机
         # =================================================================
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        proj_cfg = dict(projection_cfg or {})
+        use_prox = bool(proj_cfg.get("enabled", False))
+        outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
+        lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
         
         @jax.jit
         def fun_wrapped(x_arr):
@@ -686,6 +834,10 @@ class VEQ3D_Solver:
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
         eval_hist = []
         self._last_eval_history = eval_hist
+        if self.linear_constraint_A is None:
+            print("    >>> 线性约束投影: 未配置线性 A x = b，跳过 Layer-1")
+        else:
+            print(f"    >>> 线性约束投影: 启用 Layer-1 (约束数={self.linear_constraint_A.shape[0]})")
 
         def fun_logged(x_arr):
             r = np.array(fun_wrapped(jnp.array(x_arr)))
@@ -708,26 +860,56 @@ class VEQ3D_Solver:
                 f"(W_B={en_iter['magnetic_energy']:.6e}, W_p={en_iter['pressure_energy']:.6e})"
             )
         
-        # 将原本分散的迭代步数一次性投入，开启 verbose 观察原生收敛的丝滑
-        res = least_squares(
-            fun_logged, 
-            np.array(x0), 
-            jac=jac_logged, 
-            method='trf', 
-            xtol=ftol, 
-            ftol=ftol, 
-            max_nfev=max_nfev,
-            verbose=2,
-            callback=iter_callback
-        )
+        x_curr = self._linear_constraint_project(np.array(x0, dtype=float))
+        total_nfev = 0
+        res = None
+
+        for outer in range(outer_loops):
+            budget_left = max_nfev - total_nfev
+            if budget_left <= 0:
+                break
+            this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
+            print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
+            res = least_squares(
+                fun_logged,
+                x_curr,
+                jac=jac_logged,
+                method='trf',
+                xtol=ftol,
+                ftol=ftol,
+                max_nfev=this_chunk,
+                verbose=2,
+                callback=iter_callback
+            )
+            x_curr = np.asarray(res.x, dtype=float)
+            total_nfev += int(res.nfev)
+
+            x_curr = self._linear_constraint_project(x_curr)
+
+            if use_prox:
+                x_proj, pinfo = self._apply_proximal_projection(
+                    x_curr,
+                    pressure_scale_factor=pressure_scale_factor,
+                    projection_cfg=proj_cfg,
+                )
+                x_curr = self._linear_constraint_project(x_proj)
+                if pinfo.get("applied", False):
+                    print(
+                        "    >>> [ProximalProjection] "
+                        f"nfev={pinfo['nfev']}, ||r||: {pinfo['before_norm']:.3e} -> {pinfo['after_norm']:.3e}"
+                    )
 
         end_time = time.time()
-        phys_res_final = jax_res_fn(jnp.array(res.x), apply_scaling=True)
+        if res is None:
+            raise RuntimeError("优化未执行：max_nfev 预算不足")
+        res.x = x_curr
+        res.nfev = total_nfev
+        phys_res_final = jax_res_fn(jnp.array(x_curr), apply_scaling=True)
         phys_len = self.num_core_params 
         phys_res_only = phys_res_final[:phys_len]
-        fb_rel_final = self.metric_force_balance_rel(res.x, pressure_scale_factor)
+        fb_rel_final = self.metric_force_balance_rel(x_curr, pressure_scale_factor)
         
-        print(f"    当前网格总耗时: {end_time - start_time:.2f} s | 总函数计算: {res.nfev} 次")
+        print(f"    当前网格总耗时: {end_time - start_time:.2f} s | 总函数计算: {total_nfev} 次")
         print(f"    纯主物理残差 L2 范数: {np.linalg.norm(phys_res_only):.4e}")
         print(f"    归一化MHD力平衡误差: {fb_rel_final:.6e}")
         
@@ -1284,24 +1466,72 @@ class VEQ3D_Solver:
         self.update_grid(c_Nr, c_Nt, c_Nz)
         x_guess = np.zeros(self.num_core_params)
         self._all_eval_history = []
+        proj_phase1 = {
+            "enabled": True,
+            "outer_loops": 2,
+            "lsq_chunk_nfev": 90,
+            "strength": 0.03,
+            "boundary_strength": 0.05,
+            "anchor_weight": 1e-2,
+            "prox_max_nfev": 6,
+            "prox_ftol": 1e-7,
+        }
         
-        res_phase1 = self._run_optimization(x_guess, max_nfev=200, ftol=1e-3, pressure_scale_factor=0.0)
+        res_phase1 = self._run_optimization(
+            x_guess,
+            max_nfev=200,
+            ftol=1e-3,
+            pressure_scale_factor=0.0,
+            projection_cfg=proj_phase1,
+        )
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
         print(f">>> [Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
         print("="*70)
         self.update_grid(m_Nr, m_Nt, m_Nz)
+        proj_phase2 = {
+            "enabled": True,
+            "outer_loops": 3,
+            "lsq_chunk_nfev": 110,
+            "strength": 0.08,
+            "boundary_strength": 0.12,
+            "anchor_weight": 5e-3,
+            "prox_max_nfev": 8,
+            "prox_ftol": 1e-8,
+        }
         
-        res_phase2 = self._run_optimization(res_phase1.x, max_nfev=300, ftol=1e-5, pressure_scale_factor=0.1)
+        res_phase2 = self._run_optimization(
+            res_phase1.x,
+            max_nfev=300,
+            ftol=1e-5,
+            pressure_scale_factor=0.1,
+            projection_cfg=proj_phase2,
+        )
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
         print(f">>> [Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
         print("="*70)
         self.update_grid(h_Nr, h_Nt, h_Nz)
+        proj_phase3 = {
+            "enabled": True,
+            "outer_loops": 4,
+            "lsq_chunk_nfev": 180,
+            "strength": 0.16,
+            "boundary_strength": 0.24,
+            "anchor_weight": 2e-3,
+            "prox_max_nfev": 12,
+            "prox_ftol": 1e-9,
+        }
         
-        res_fine = self._run_optimization(res_phase2.x, max_nfev=800, ftol=1e-12, pressure_scale_factor=1.0)
+        res_fine = self._run_optimization(
+            res_phase2.x,
+            max_nfev=800,
+            ftol=1e-12,
+            pressure_scale_factor=1.0,
+            projection_cfg=proj_phase3,
+        )
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
         phase_total_end_time = time.time()
 
