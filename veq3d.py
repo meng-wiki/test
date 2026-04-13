@@ -414,29 +414,31 @@ class VEQ3D_Solver:
             out[i] = out[i - 1] + 0.5 * (y[i] + y[i - 1]) * dr
         return out
 
+    def _surface_mean_tz(self, f_rtz):
+        """对每个 rho 磁面做 (theta, zeta) 平均，避免广播分母陷阱。"""
+        return np.mean(f_rtz, axis=(1, 2))
+
     def _profile_projection_data(self, x_core, pressure_scale_factor):
         """构造 proximal 投影所需的重构剖面与目标剖面。"""
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
-        w_tz = self.weights_3d * self.dtheta * self.dzeta
-        den = np.sum(w_tz, axis=(1, 2)) + 1e-14
 
-        dP_est = np.sum(
-            w_tz * (s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0),
-            axis=(1, 2),
-        ) / den
-        dP_tar = np.sum(w_tz * s["dP"], axis=(1, 2)) / den
-        P_tar = np.sum(w_tz * s["P"], axis=(1, 2)) / den
+        dP_est = self._surface_mean_tz(
+            s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0
+        )
+        dP_tar = self._surface_mean_tz(s["dP"])
+        P_tar = self._surface_mean_tz(s["P"])
 
         Phip_est_3d = 2 * np.pi * s["sqrt_g"] * s["Bz_sup"] - s["Lt"]
         psip_est_3d = self.N_fp * (2 * np.pi * s["sqrt_g"] * s["Bt_sup"] + s["Lz"])
-        Phip_est = np.sum(w_tz * Phip_est_3d, axis=(1, 2)) / den
-        psip_est = np.sum(w_tz * psip_est_3d, axis=(1, 2)) / den
+        Phip_est = self._surface_mean_tz(Phip_est_3d)
+        psip_est = self._surface_mean_tz(psip_est_3d)
 
-        Phip_tar = np.sum(w_tz * s["Phip"], axis=(1, 2)) / den
-        psip_tar = np.sum(w_tz * s["psip"], axis=(1, 2)) / den
+        Phip_tar = self._surface_mean_tz(s["Phip"])
+        psip_tar = self._surface_mean_tz(s["psip"])
 
-        phi_est = self._radial_integrate_forward(Phip_est, y0=0.0)
-        psi_est = self._radial_integrate_forward(psip_est, y0=0.0)
+        # rho 网格从 rho[0] > 0 开始，补偿 [0, rho0] 的梯形面积可减小常数偏置
+        phi_est = self._radial_integrate_forward(Phip_est, y0=0.5 * float(Phip_est[0]) * self.rho[0])
+        psi_est = self._radial_integrate_forward(psip_est, y0=0.5 * float(psip_est[0]) * self.rho[0])
         phi_tar = self.Phi_a * self.rho**2
         psi_tar = self.compute_psi(self.rho)
 
@@ -1117,13 +1119,11 @@ class VEQ3D_Solver:
 
     def metric_profile_reconstruction_error(self, x_core, pressure_scale_factor=1.0):
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
-        w_tz = self.weights_3d * self.dtheta * self.dzeta
-        dP_est = np.sum(
-            w_tz * (s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0),
-            axis=(1, 2),
-        ) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
-        dP_tar = np.sum(w_tz * s["dP"], axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
-        P_tar = np.sum(w_tz * s["P"], axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        dP_est = self._surface_mean_tz(
+            s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0
+        )
+        dP_tar = self._surface_mean_tz(s["dP"])
+        P_tar = self._surface_mean_tz(s["P"])
         P_est = np.zeros_like(P_tar)
         for i in range(1, len(self.rho)):
             dr = self.rho[i] - self.rho[i - 1]
@@ -1144,11 +1144,10 @@ class VEQ3D_Solver:
 
     def metric_rotational_transform_error(self, x_core, pressure_scale_factor=1.0):
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
-        w_tz = self.weights_3d * self.dtheta * self.dzeta
         Phip_est_3d = 2 * np.pi * s["sqrt_g"] * s["Bz_sup"] - s["Lt"]
         psip_est_3d = self.N_fp * (2 * np.pi * s["sqrt_g"] * s["Bt_sup"] + s["Lz"])
-        Phip_est = np.sum(w_tz * Phip_est_3d, axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
-        psip_est = np.sum(w_tz * psip_est_3d, axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        Phip_est = self._surface_mean_tz(Phip_est_3d)
+        psip_est = self._surface_mean_tz(psip_est_3d)
         iota_est = psip_est / (Phip_est + 1e-14)
         iota_tar = 1.0 + 1.5 * self.rho**2
         rmse = np.sqrt(np.mean((iota_est - iota_tar) ** 2))
@@ -1167,6 +1166,7 @@ class VEQ3D_Solver:
         iota_data = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
         Phip_est = iota_data["Phip_recon"]
         phi_est = np.zeros_like(Phip_est)
+        phi_est[0] = 0.5 * float(Phip_est[0]) * self.rho[0]
         for i in range(1, len(self.rho)):
             dr = self.rho[i] - self.rho[i - 1]
             phi_est[i] = phi_est[i - 1] + 0.5 * (Phip_est[i] + Phip_est[i - 1]) * dr
@@ -1185,6 +1185,7 @@ class VEQ3D_Solver:
         iota_data = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
         psip_est = iota_data["psip_recon"]
         psi_est = np.zeros_like(psip_est)
+        psi_est[0] = 0.5 * float(psip_est[0]) * self.rho[0]
         for i in range(1, len(self.rho)):
             dr = self.rho[i] - self.rho[i - 1]
             psi_est[i] = psi_est[i - 1] + 0.5 * (psip_est[i] + psip_est[i - 1]) * dr
