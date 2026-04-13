@@ -6,18 +6,160 @@ import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 import time
+from typing import Callable, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# 径向坐标 ρ（与 DESC / PEST 类 flux 坐标一致）
+#   ψ_N := Ψ/Ψ_a  归一化环向磁通（磁轴 ψ_N=0，最外闭合面 ψ_N=1）
+#   ρ := √ψ_N      本文件中所有 ρ、RHO、径向谱变量均基于此定义，故 ψ_N = ρ²
+#   Ψ(ρ) = Ψ_a·ρ²（取轴上 Ψ=0），dΨ/dρ = 2 Ψ_a ρ，与 _get_profiles 的 Phip 一致
+# 径向 Chebyshev 节点映射 x = 2ρ²−1 = 2ψ_N−1，即在 ψ_N 上谱离散。
+# ---------------------------------------------------------------------------
+
+# 边界目标面 R,Z 为 (theta, zeta) 的函数；
+# 默认使用结构化参数字典 + 生成器函数（由 VEQ RZ 解析式在 rho=1 处生成 LCFS）。
+_DEFAULT_BOUNDARY_PARAMS = {
+    "R0": 10,
+    "Z0": 0,
+    "c0R": [0, 0, -1.3e-04],  # [n=0, cos(zeta), sin(zeta)]
+    "c0Z": [0, 0, -2.9e-01],
+    "h": [0, -2.67e-01, 0],
+    "v": [0, 0, 0],
+    "k": [-1, 2.8e-01, 0],
+    "a": [1, 3.15e-03, 0],
+    # (m,n,typ): coeff, typ in {"c","s"}, phase = m*th - n*ze
+    "tR_modes": {
+        (1, -1, "c"): 0,
+        (1, -1, "s"): 5.4e-01,
+        (1, 0, "c"): 0,
+        (1, 0, "s"): 2.4e-05,
+        (1, 1, "c"): 0,
+        (1, 1, "s"): 1.45e-02,
+    },
+    "tZ_modes": {
+        (1, -1, "c"): 0,
+        (1, -1, "s"): 0,
+        (1, 0, "c"): 0,
+        (1, 0, "s"): 0,
+        (1, 1, "c"): 0,
+        (1, 1, "s"): 0,
+    },
+}
+
+
+def _eval_1d_series(coeffs, ze):
+    """评估 1D zeta 级数：c0 + c1c*cos(ze) + c1s*sin(ze) + ..."""
+    c = np.asarray(coeffs, dtype=float).reshape(-1)
+    out = np.zeros_like(ze, dtype=float)
+    if c.size == 0:
+        return out
+    out = out + c[0]
+    idx = 1
+    n = 1
+    while idx + 1 < c.size:
+        out = out + c[idx] * np.cos(n * ze) + c[idx + 1] * np.sin(n * ze)
+        idx += 2
+        n += 1
+    return out
+
+
+def _eval_2d_modes(mode_dict, th, ze):
+    """评估 2D 模态和：sum c_mn * cos/sin(m*th - n*ze)"""
+    out = np.zeros_like(th, dtype=float)
+    for (m, n, typ), coeff in mode_dict.items():
+        phase = m * th - n * ze
+        if typ == "c":
+            out = out + coeff * np.cos(phase)
+        else:
+            out = out + coeff * np.sin(phase)
+    return out
+
+
+def _build_boundary_pair_from_params(params):
+    """由结构化边界参数生成 (R(th,ze), Z(th,ze)) 函数对。"""
+    p = dict(params)
+
+    def R(th: np.ndarray, ze: np.ndarray) -> np.ndarray:
+        c0R = _eval_1d_series(p["c0R"], ze)
+        h = _eval_1d_series(p["h"], ze)
+        a = _eval_1d_series(p["a"], ze)
+        tR = _eval_2d_modes(p.get("tR_modes", {}), th, ze)
+        thR = th + c0R + tR
+        return p["R0"] + a * (h - np.cos(thR))
+
+    def Z(th: np.ndarray, ze: np.ndarray) -> np.ndarray:
+        c0Z = _eval_1d_series(p["c0Z"], ze)
+        v = _eval_1d_series(p["v"], ze)
+        k = _eval_1d_series(p["k"], ze)
+        a = _eval_1d_series(p["a"], ze)
+        tZ = _eval_2d_modes(p.get("tZ_modes", {}), th, ze)
+        thZ = th + c0Z + tZ
+        return p["Z0"] + a * (v - k * np.sin(thZ))
+
+    return R, Z
+
+
+def _compile_boundary_pair(
+    expr_R: str, expr_Z: str
+) -> Tuple[Callable[[np.ndarray, np.ndarray], np.ndarray], Callable[[np.ndarray, np.ndarray], np.ndarray]]:
+    """将字符串解析为 (R(th,ze), Z(th,ze))，可用变量：th, ze（别名 theta, zeta），以及 np.*。"""
+    globs = {"np": np, "__builtins__": {}}
+    code_R = compile(expr_R.strip(), "<boundary_R>", "eval")
+    code_Z = compile(expr_Z.strip(), "<boundary_Z>", "eval")
+
+    def R(th: np.ndarray, ze: np.ndarray) -> np.ndarray:
+        loc = {"th": th, "ze": ze, "theta": th, "zeta": ze}
+        return eval(code_R, globs, loc)
+
+    def Z(th: np.ndarray, ze: np.ndarray) -> np.ndarray:
+        loc = {"th": th, "ze": ze, "theta": th, "zeta": ze}
+        return eval(code_Z, globs, loc)
+
+    return R, Z
+
 
 class VEQ3D_Solver:
-    def __init__(self):
+    """3D 力平衡求解；径向标签 ρ 统一定义为归一化环向磁通的平方根 ρ=√(Ψ/Ψ_a)。"""
+
+    def __init__(
+        self,
+        boundary_R_expr: Optional[str] = None,
+        boundary_Z_expr: Optional[str] = None,
+        boundary_fns: Optional[Tuple[Callable, Callable]] = None,
+    ):
+        if boundary_fns is not None:
+            self._boundary_R_fn, self._boundary_Z_fn = boundary_fns
+            self.boundary_R_expr = None
+            self.boundary_Z_expr = None
+        else:
+            # 显式给了表达式时，保持旧接口；否则走参数字典生成默认边界
+            if boundary_R_expr is not None or boundary_Z_expr is not None:
+                R_def, Z_def = _build_boundary_pair_from_params(_DEFAULT_BOUNDARY_PARAMS)
+                self.boundary_R_expr = boundary_R_expr
+                self.boundary_Z_expr = boundary_Z_expr
+                if boundary_R_expr is not None and boundary_Z_expr is not None:
+                    self._boundary_R_fn, self._boundary_Z_fn = _compile_boundary_pair(boundary_R_expr, boundary_Z_expr)
+                elif boundary_R_expr is not None:
+                    R_user, _ = _compile_boundary_pair(boundary_R_expr, "0.0*th")
+                    self._boundary_R_fn, self._boundary_Z_fn = R_user, Z_def
+                else:
+                    _, Z_user = _compile_boundary_pair("0.0*th", boundary_Z_expr)
+                    self._boundary_R_fn, self._boundary_Z_fn = R_def, Z_user
+            else:
+                self.boundary_R_expr = None
+                self.boundary_Z_expr = None
+                self._boundary_R_fn, self._boundary_Z_fn = _build_boundary_pair_from_params(_DEFAULT_BOUNDARY_PARAMS)
+
         # =========================================================
         # [自由度扩容] 提升表达能力以包容 3D 边界调制
         # =========================================================
-        self.M_pol = 2  
+        self.M_pol = 1 
         self.N_tor = 1
-        self.L_rad = 3  
+        self.L_rad = 3
         # =========================================================
         
-        self.N_fp = 19  
+        self.N_fp = 19
+        # Ψ_a：最外闭合面内总环向磁通（与 ψ_N=Ψ/Ψ_a、ρ=√ψ_N 配套；单位与 Phip=dΨ/dρ 一致）
         self.Phi_a = 1.0
         self.mu_0 = 4 * np.pi * 1e-7
         
@@ -26,6 +168,8 @@ class VEQ3D_Solver:
         self.target_Nz = 16
         
         self.p_edge = None  
+        # det 手性方向（+1/-1）：用于兼容输入 LCFS 与 RZ 参数化方向差异
+        self.det_chirality = 1.0
         
         self._setup_modes()
         
@@ -39,9 +183,10 @@ class VEQ3D_Solver:
         self.Nz_grid = Nz_grid
         
         rho_nodes, self.rho_weights = self._get_chebyshev_nodes_and_weights(self.Nr)
+        # ρ = √ψ_N ∈ (0,1]：Chebyshev 原点在 x∈[-1,1]，映射到 ρ；最外面对应 ψ_N=1、ρ=1
         self.rho = 0.5 * (rho_nodes + 1)
         self.rho_weights *= 0.5
-        
+
         self.D_matrix = self._get_spectral_diff_matrix(self.rho)
         
         self.k_th = np.fft.fftfreq(self.Nt_grid, d=1.0/self.Nt_grid)[None, :, None]
@@ -59,6 +204,7 @@ class VEQ3D_Solver:
         self._build_basis_matrices()
 
     def _precompute_radial_factors(self):
+        # x = 2ψ_N − 1 = 2ρ² − 1，径向 Chebyshev 自变量为归一化环向磁通 ψ_N=ρ²
         x = 2.0 * self.rho**2 - 1.0
         T_list = []
         dTdx_list = []
@@ -208,13 +354,20 @@ class VEQ3D_Solver:
         self.res_scales[self.num_geom_params:] = 1e6
 
     def compute_psi(self, rho):
+        """极向磁通 ψ(ρ)，与 _get_profiles 中 psip=dψ/dρ 保持一致。"""
+        # 约定：phi(ρ) 为环向磁通，dphi/dρ = Phip = 2*Phi_a*ρ
+        #      psi(ρ) 为极向磁通，dpsi/dρ = psip = iota(ρ)*Phip
+        # 这里 iota(ρ)=1+1.5ρ²，积分并取 psi(0)=0 得
+        # psi(ρ)=Phi_a*(ρ²+0.75ρ⁴)
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
     def _get_profiles(self, rho, pressure_scale_factor):
-        P_scale = 1.8e4 
+        """剖面输入：P(ρ), dP/dρ, dphi/dρ(Phip), dpsi/dρ(psip)。"""
+        P_scale = 1.8e4
+        # p 仅为 ψ_N 的函数：(ψ_N−1)² 在边界 ψ_N=1 处为零
         P = pressure_scale_factor * P_scale * (rho**2 - 1)**2
         dP_drho = pressure_scale_factor * P_scale * 4 * rho * (rho**2 - 1)
-        
+
         iota = 1.0 + 1.5 * rho**2
         Phip = 2 * rho * self.Phi_a
         psip = iota * Phip
@@ -222,8 +375,8 @@ class VEQ3D_Solver:
 
     def fit_boundary(self):
         TH_F, ZE_F = self.TH[0], self.ZE[0]
-        R_target = 10 - np.cos(TH_F) - 0.3 * np.cos(TH_F + ZE_F)
-        Z_target = np.sin(TH_F) - 0.3 * np.sin(TH_F + ZE_F)
+        R_target = np.asarray(self._boundary_R_fn(TH_F, ZE_F), dtype=float)
+        Z_target = np.asarray(self._boundary_Z_fn(TH_F, ZE_F), dtype=float)
         
         def eval_1d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
         def eval_2d_edge(coeffs): return np.sum(coeffs[:, None, None] * self.basis_2d_edge, axis=0) if self.len_2d > 0 else 0.0
@@ -261,7 +414,73 @@ class VEQ3D_Solver:
         
         res = least_squares(boundary_residuals, p0, method='trf', ftol=1e-12)
         self.p_edge = res.x
+        self.det_chirality = self._infer_det_chirality_from_boundary(R_target, Z_target)
         print(f"    >>> 边界拟合完成 (Max Residual: {np.max(np.abs(res.fun)):.3e})")
+        print(f"    >>> det 手性方向已锁定: {self.det_chirality:+.0f}")
+        x_ref = np.zeros(self.num_core_params)
+        ref_state = self._compute_state_numpy(x_ref, pressure_scale_factor=0.0)
+        det_ref = ref_state["det_phys"].reshape(-1)
+        det_eff_ref = ref_state["det_eff"].reshape(-1)
+        print(f"    >>> 参考态 det_phys 中位数: {np.median(det_ref):+.3e}, det_eff 中位数: {np.median(det_eff_ref):+.3e}")
+
+    def _signed_area_theta_loop(self, R_curve, Z_curve):
+        R1 = np.asarray(R_curve).reshape(-1)
+        Z1 = np.asarray(Z_curve).reshape(-1)
+        Rp = np.roll(R1, -1)
+        Zp = np.roll(Z1, -1)
+        return 0.5 * np.sum(R1 * Zp - Rp * Z1)
+
+    def _infer_det_chirality_from_boundary(self, R_target, Z_target):
+        e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
+        TH_F = self.TH[0]
+        ZE_F = self.ZE[0]
+
+        c0R_v = np.sum(e_c0R[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        c0Z_v = np.sum(e_c0Z[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        h_v = np.sum(e_h[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        v_v = np.sum(e_v[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        k_v = np.sum(e_k[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        a_v = np.sum(e_a[:, None, None] * self.basis_1d_val[:, 0, ...], axis=0)
+        if self.len_2d > 0:
+            tR_v = np.sum(e_tR[:, None, None] * self.basis_2d_edge, axis=0)
+            tZ_v = np.sum(e_tZ[:, None, None] * self.basis_2d_edge, axis=0)
+        else:
+            tR_v = 0.0
+            tZ_v = 0.0
+
+        thR = TH_F + c0R_v + tR_v
+        thZ = TH_F + c0Z_v + tZ_v
+        R_fit = e_R0 + a_v * (h_v - np.cos(thR))
+        Z_fit = e_Z0 + a_v * (v_v - k_v * np.sin(thZ))
+
+        area_t, area_f = [], []
+        for j in range(self.Nz_grid):
+            at = self._signed_area_theta_loop(R_target[:, j], Z_target[:, j])
+            af = self._signed_area_theta_loop(R_fit[:, j], Z_fit[:, j])
+            area_t.append(at)
+            area_f.append(af)
+        area_t = np.asarray(area_t)
+        area_f = np.asarray(area_f)
+
+        mean_t = np.mean(area_t[np.abs(area_t) > 1e-12]) if np.any(np.abs(area_t) > 1e-12) else np.mean(area_t)
+        mean_f = np.mean(area_f[np.abs(area_f) > 1e-12]) if np.any(np.abs(area_f) > 1e-12) else np.mean(area_f)
+        s_t = 1.0 if mean_t >= 0.0 else -1.0
+        s_f = 1.0 if mean_f >= 0.0 else -1.0
+        boundary_match = 1.0 if s_t * s_f > 0.0 else -1.0
+
+        # 关键：det 的天然符号由参数化映射决定，不能只看边界曲线同向性
+        # 用“当前边界 + 零 core”参考态估计 det 主符号，避免将天然负号误判为坏网格。
+        x_ref = np.zeros(self.num_core_params)
+        s_ref = self._compute_state_numpy(x_ref, pressure_scale_factor=0.0)
+        det_ref = np.asarray(s_ref["det_phys"]).reshape(-1)
+        det_ref_nz = det_ref[np.abs(det_ref) > 1e-12]
+        if det_ref_nz.size == 0:
+            det_sign_ref = 1.0
+        else:
+            det_sign_ref = 1.0 if np.median(det_ref_nz) >= 0.0 else -1.0
+
+        # 若边界方向存在反手性，则翻转一次；否则沿用参考 det 符号
+        return det_sign_ref * boundary_match
 
     def _build_jax_residual_fn(self, pressure_scale_factor=1.0):
         RHO, TH, ZE = jnp.array(self.RHO), jnp.array(self.TH), jnp.array(self.ZE)
@@ -280,6 +499,7 @@ class VEQ3D_Solver:
         
         k_th, k_ze, weights_3d = jnp.array(self.k_th), jnp.array(self.k_ze), jnp.array(self.weights_3d)
         res_scales, p_edge = jnp.array(self.res_scales), jnp.array(self.p_edge)
+        det_chirality = jnp.array(self.det_chirality)
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
         N_fp, mu_0, dtheta, dzeta = self.N_fp, self.mu_0, self.dtheta, self.dzeta
@@ -347,7 +567,8 @@ class VEQ3D_Solver:
             Zz = az * (v - k * RHO * jnp.sin(thZ)) + a * (vz - kz * RHO * jnp.sin(thZ) - k * RHO * jnp.cos(thZ) * thZ_z)
 
             det_phys = Rr * Zt - Rt * Zr
-            sqrt_g = (R / N_fp) * det_phys 
+            det_eff = det_chirality * det_phys
+            sqrt_g = (R / N_fp) * det_eff 
             
             g_rr, g_tt = Rr**2 + Zr**2, Rt**2 + Zt**2
             g_zz = Rz**2 + (R/N_fp)**2 + Zz**2 
@@ -417,7 +638,7 @@ class VEQ3D_Solver:
             res_list = [res_geom]
             
             if len_lam > 0:
-                vol_w = metric_w * det_phys
+                vol_w = metric_w * det_eff
                 term_lam = Jr_phys * vol_w
                 term_lam_tz = jnp.einsum('rtz,mtz->rm', term_lam, basis_lam_tz) 
                 res_lam = jnp.dot(fac_lam_proj, rho_m_lam.T * term_lam_tz)
@@ -431,7 +652,8 @@ class VEQ3D_Solver:
             # =================================================================
             # [物理闭环终极修复 2]：仅对严重交叠进行惩罚，放行磁轴自然演化
             # =================================================================
-            penalty_res = jnp.where(det_phys > 1e-6, 1e4 * (det_phys - 1e-6), 0.0).flatten()
+            # 基于手性修正后的 det_eff 施加约束，要求 det_eff >= eps
+            penalty_res = jnp.where(det_eff < 1e-6, 1e3 * (1e-6 - det_eff), 0.0).flatten()
                 
             final_res_list = [phys_res, penalty_res]
             
@@ -462,48 +684,609 @@ class VEQ3D_Solver:
 
         start_time = time.time()
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
+        eval_hist = []
+        self._last_eval_history = eval_hist
+
+        def fun_logged(x_arr):
+            r = np.array(fun_wrapped(jnp.array(x_arr)))
+            eval_hist.append(float(np.linalg.norm(r)))
+            return r
+
+        def jac_logged(x_arr):
+            return np.array(jac_wrapped(jnp.array(x_arr)))
+
+        iter_counter = 0
+
+        def iter_callback(intermediate_result):
+            nonlocal iter_counter
+            iter_counter += 1
+            x_iter = np.array(intermediate_result.x, dtype=float)
+            en_iter = self.metric_global_energy_terms(x_iter, pressure_scale_factor)
+            print(
+                f"    [Iter {iter_counter:03d}] "
+                f"W_mhd={en_iter['total_energy']:.6e} "
+                f"(W_B={en_iter['magnetic_energy']:.6e}, W_p={en_iter['pressure_energy']:.6e})"
+            )
         
         # 将原本分散的迭代步数一次性投入，开启 verbose 观察原生收敛的丝滑
         res = least_squares(
-            fun_wrapped, 
+            fun_logged, 
             np.array(x0), 
-            jac=jac_wrapped, 
+            jac=jac_logged, 
             method='trf', 
             xtol=ftol, 
             ftol=ftol, 
             max_nfev=max_nfev,
-            verbose=2 
+            verbose=2,
+            callback=iter_callback
         )
 
         end_time = time.time()
         phys_res_final = jax_res_fn(jnp.array(res.x), apply_scaling=True)
         phys_len = self.num_core_params 
         phys_res_only = phys_res_final[:phys_len]
+        fb_rel_final = self.metric_force_balance_rel(res.x, pressure_scale_factor)
         
         print(f"    当前网格总耗时: {end_time - start_time:.2f} s | 总函数计算: {res.nfev} 次")
         print(f"    纯主物理残差 L2 范数: {np.linalg.norm(phys_res_only):.4e}")
+        print(f"    归一化MHD力平衡误差: {fb_rel_final:.6e}")
         
         return res
+
+    def _spectral_grad_th_np(self, f):
+        return np.real(np.fft.ifft(1j * self.k_th * np.fft.fft(f, axis=1), axis=1))
+
+    def _spectral_grad_ze_np(self, f):
+        return np.real(np.fft.ifft(1j * self.k_ze * np.fft.fft(f, axis=2), axis=2))
+
+    def _compute_state_numpy(self, x_core, pressure_scale_factor=1.0):
+        RHO, TH, ZE = self.RHO, self.TH, self.ZE
+        D_matrix = self.D_matrix
+
+        e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = self.unpack_edge()
+        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
+
+        basis_1d_val_slice = self.basis_1d_val[:, 0, 0, :]
+        basis_1d_dz_slice = self.basis_1d_dz[:, 0, 0, :]
+
+        def eval_1d(c_e, c_c):
+            core_contrib = np.dot(c_c.T, self.fac_rad)
+            ce_eff = c_e[:, None] + core_contrib
+            val = np.dot(ce_eff.T, basis_1d_val_slice)[:, None, :]
+            dz = np.dot(ce_eff.T, basis_1d_dz_slice)[:, None, :]
+            dr_contrib = np.dot(c_c.T, self.dfac_rad)
+            dr = np.dot(dr_contrib.T, basis_1d_val_slice)[:, None, :]
+            return val, dr, dz
+
+        def eval_2d(c_e, c_c):
+            if self.len_2d == 0:
+                z = np.zeros((self.Nr, self.Nt_grid, self.Nz_grid))
+                return z, z, z, z
+            core_contrib = np.dot(c_c.T, self.fac_rad)
+            ce_eff = c_e[:, None] + core_contrib
+            val = np.sum(ce_eff[:, :, None, None] * self.basis_2d_val, axis=0)
+            dth = np.sum(ce_eff[:, :, None, None] * self.basis_2d_dth, axis=0)
+            dz = np.sum(ce_eff[:, :, None, None] * self.basis_2d_dze, axis=0)
+            dr_contrib = np.dot(c_c.T, self.dfac_rad)
+            dr = np.sum(
+                dr_contrib[:, :, None, None] * self.basis_2d_val
+                + ce_eff[:, :, None, None] * self.basis_2d_dr,
+                axis=0,
+            )
+            return val, dr, dth, dz
+
+        c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
+        c0Z, c0Zr, c0Zz = eval_1d(e_c0Z, c_c0Z)
+        h, hr, hz = eval_1d(e_h, c_h)
+        v, vr, vz = eval_1d(e_v, c_v)
+        k, kr, kz = eval_1d(e_k, c_k)
+        a, ar, az = eval_1d(e_a, c_a)
+        tR, tRr, tRth, tRz = eval_2d(e_tR, c_tR)
+        tZ, tZr, tZth, tZz = eval_2d(e_tZ, c_tZ)
+
+        thR = TH + c0R + tR
+        thZ = TH + c0Z + tZ
+        thR_r, thR_th, thR_z = c0Rr + tRr, 1.0 + tRth, c0Rz + tRz
+        thZ_r, thZ_th, thZ_z = c0Zr + tZr, 1.0 + tZth, c0Zz + tZz
+
+        R = e_R0 + a * (h - RHO * np.cos(thR))
+        Rr = ar * (h - RHO * np.cos(thR)) + a * (hr - np.cos(thR) + RHO * np.sin(thR) * thR_r)
+        Rt = a * RHO * np.sin(thR) * thR_th
+        Rz = az * (h - RHO * np.cos(thR)) + a * (hz + RHO * np.sin(thR) * thR_z)
+
+        Z = e_Z0 + a * (v - k * RHO * np.sin(thZ))
+        Zr = ar * (v - k * RHO * np.sin(thZ)) + a * (
+            vr - kr * RHO * np.sin(thZ) - k * np.sin(thZ) - k * RHO * np.cos(thZ) * thZ_r
+        )
+        Zt = -a * k * RHO * np.cos(thZ) * thZ_th
+        Zz = az * (v - k * RHO * np.sin(thZ)) + a * (
+            vz - kz * RHO * np.sin(thZ) - k * RHO * np.cos(thZ) * thZ_z
+        )
+
+        det_phys = Rr * Zt - Rt * Zr
+        det_eff = self.det_chirality * det_phys
+        sqrt_g = (R / self.N_fp) * det_eff
+
+        g_rr = Rr**2 + Zr**2
+        g_tt = Rt**2 + Zt**2
+        g_zz = Rz**2 + (R / self.N_fp) ** 2 + Zz**2
+        g_rt = Rr * Rt + Zr * Zt
+        g_rz = Rr * Rz + Zr * Zz
+        g_tz = Rt * Rz + Zt * Zz
+
+        if self.len_lam > 0:
+            lam_ce = np.dot(c_lam.T, self.fac_lam_eval) * self.rho_m_lam
+            Lt = np.einsum("mr,mtz->rtz", lam_ce, self.basis_lam_dth[:, 0, :, :])
+            Lz = np.einsum("mr,mtz->rtz", lam_ce, self.basis_lam_dze[:, 0, :, :])
+        else:
+            Lt = np.zeros_like(R)
+            Lz = np.zeros_like(R)
+
+        P, dP, Phip, psip = self._get_profiles(RHO, pressure_scale_factor)
+
+        Bt_sup = (psip / self.N_fp - Lz) / (2 * np.pi * sqrt_g)
+        Bz_sup = (Phip + Lt) / (2 * np.pi * sqrt_g)
+        Br_sup = np.zeros_like(Bt_sup)
+
+        Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
+        Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
+        Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
+
+        dBt_drho = np.tensordot(D_matrix, Bt_sub, axes=(1, 0))
+        dBz_drho = np.tensordot(D_matrix, Bz_sub, axes=(1, 0))
+
+        Jz_sup = (dBt_drho - self._spectral_grad_th_np(Br_sub)) / sqrt_g
+        Jt_sup = (self._spectral_grad_ze_np(Br_sub) - dBz_drho) / sqrt_g
+        Jr_sup = (self._spectral_grad_th_np(Bz_sub) - self._spectral_grad_ze_np(Bt_sub)) / sqrt_g
+        Jr_phys = Jr_sup / self.mu_0
+
+        G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / self.mu_0
+        F_rho = G_rho
+        F_beta = (Jr_phys / (2 * np.pi)) * (Phip + Lt)
+
+        return {
+            "R": R, "Z": Z, "Rr": Rr, "Rt": Rt, "Rz": Rz, "Zr": Zr, "Zt": Zt, "Zz": Zz,
+            "det_phys": det_phys, "det_eff": det_eff, "sqrt_g": sqrt_g, "P": P, "dP": dP, "Phip": Phip, "psip": psip,
+            "Lt": Lt, "Lz": Lz, "Bt_sup": Bt_sup, "Bz_sup": Bz_sup, "Br_sup": Br_sup,
+            "Br_sub": Br_sub, "Bt_sub": Bt_sub, "Bz_sub": Bz_sub,
+            "Jr_sup": Jr_sup, "Jt_sup": Jt_sup, "Jz_sup": Jz_sup, "Jr_phys": Jr_phys,
+            "G_rho": G_rho, "F_rho": F_rho, "F_beta": F_beta,
+            "g_rr": g_rr, "g_tt": g_tt, "g_zz": g_zz, "g_rt": g_rt, "g_rz": g_rz, "g_tz": g_tz
+        }
+
+    def _volume_weights(self, state):
+        # 验证指标使用正权重，避免手性符号导致的积分抵消或负权重 sqrt 数值问题
+        return np.abs(state["sqrt_g"]) * self.weights_3d * self.dtheta * self.dzeta
+
+    def metric_force_balance_L2(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w = self._volume_weights(s)
+        v = np.sqrt(s["F_rho"] ** 2 + s["F_beta"] ** 2)
+        return float(np.sqrt(np.sum(w * v**2)))
+
+    def metric_force_balance_rel(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w = self._volume_weights(s)
+        lhs = np.sqrt(np.sum(w * (s["F_rho"] ** 2 + s["F_beta"] ** 2)))
+        rhs = np.sqrt(np.sum(w * (s["dP"] ** 2))) + 1e-14
+        return float(lhs / rhs)
+
+    def metric_divB_L2(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        sqrtg = s["sqrt_g"]
+        divB = (self._spectral_grad_th_np(sqrtg * s["Bt_sup"]) + self._spectral_grad_ze_np(sqrtg * s["Bz_sup"])) / sqrtg
+        w = self._volume_weights(s)
+        return float(np.sqrt(np.sum(w * divB**2)))
+
+    def metric_divB_rel(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        sqrtg = s["sqrt_g"]
+        divB = (self._spectral_grad_th_np(sqrtg * s["Bt_sup"]) + self._spectral_grad_ze_np(sqrtg * s["Bz_sup"])) / sqrtg
+        B_mag = np.sqrt(s["Bt_sup"] * s["Bt_sub"] + s["Bz_sup"] * s["Bz_sub"])
+        w = self._volume_weights(s)
+        lhs = np.sqrt(np.sum(w * divB**2))
+        rhs = np.sqrt(np.sum(w * B_mag**2)) + 1e-14
+        return float(lhs / rhs)
+
+    def metric_jacobian_stats(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        d = s["det_phys"].flatten()
+        de = s["det_eff"].flatten()
+        return {
+            "min": float(np.min(d)),
+            "p1": float(np.percentile(d, 1)),
+            "p50": float(np.percentile(d, 50)),
+            "p99": float(np.percentile(d, 99)),
+            "negative_fraction": float(np.mean(d < 0.0)),
+            "eff_min": float(np.min(de)),
+            "eff_negative_fraction": float(np.mean(de < 0.0)),
+        }
+
+    def metric_current_closure_L2(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        sqrtg = s["sqrt_g"]
+        divJ = (
+            np.tensordot(self.D_matrix, sqrtg * s["Jr_sup"], axes=(1, 0))
+            + self._spectral_grad_th_np(sqrtg * s["Jt_sup"])
+            + self._spectral_grad_ze_np(sqrtg * s["Jz_sup"])
+        ) / sqrtg
+        w = self._volume_weights(s)
+        return float(np.sqrt(np.sum(w * divJ**2)))
+
+    def metric_axis_location(self, x_core, nz_samples=128, nt_samples=128):
+        zeta = np.linspace(0, 2 * np.pi, nz_samples, endpoint=False)
+        theta = np.linspace(0, 2 * np.pi, nt_samples, endpoint=False)
+        R_axis = np.zeros_like(zeta)
+        Z_axis = np.zeros_like(zeta)
+        for i, zv in enumerate(zeta):
+            Rv, Zv = self.compute_geometry(x_core, 0.0, theta, zv)[:2]
+            R_axis[i] = np.mean(np.asarray(Rv))
+            Z_axis[i] = np.mean(np.asarray(Zv))
+        out = {
+            "zeta": zeta,
+            "R_axis": R_axis,
+            "Z_axis": Z_axis,
+            "R_std": float(np.std(R_axis)),
+            "Z_std": float(np.std(Z_axis)),
+            "R_mean": float(np.mean(R_axis)),
+            "Z_mean": float(np.mean(Z_axis)),
+        }
+        return out
+
+    def metric_profile_reconstruction_error(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w_tz = self.weights_3d * self.dtheta * self.dzeta
+        dP_est = np.sum(
+            w_tz * (s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0),
+            axis=(1, 2),
+        ) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        dP_tar = np.sum(w_tz * s["dP"], axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        P_tar = np.sum(w_tz * s["P"], axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        P_est = np.zeros_like(P_tar)
+        for i in range(1, len(self.rho)):
+            dr = self.rho[i] - self.rho[i - 1]
+            P_est[i] = P_est[i - 1] + 0.5 * (dP_est[i] + dP_est[i - 1]) * dr
+        P_est = P_est - P_est[-1]
+        P_tar = P_tar - P_tar[-1]
+        err = np.sqrt(np.mean((P_est - P_tar) ** 2))
+        rel = err / (np.sqrt(np.mean(P_tar**2)) + 1e-14)
+        return {
+            "rho": self.rho.copy(),
+            "P_target": P_tar,
+            "P_recon": P_est,
+            "dP_target": dP_tar,
+            "dP_recon": dP_est,
+            "rmse": float(err),
+            "rel_rmse": float(rel),
+        }
+
+    def metric_rotational_transform_error(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w_tz = self.weights_3d * self.dtheta * self.dzeta
+        Phip_est_3d = 2 * np.pi * s["sqrt_g"] * s["Bz_sup"] - s["Lt"]
+        psip_est_3d = self.N_fp * (2 * np.pi * s["sqrt_g"] * s["Bt_sup"] + s["Lz"])
+        Phip_est = np.sum(w_tz * Phip_est_3d, axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        psip_est = np.sum(w_tz * psip_est_3d, axis=(1, 2)) / (np.sum(w_tz, axis=(1, 2)) + 1e-14)
+        iota_est = psip_est / (Phip_est + 1e-14)
+        iota_tar = 1.0 + 1.5 * self.rho**2
+        rmse = np.sqrt(np.mean((iota_est - iota_tar) ** 2))
+        rel = rmse / (np.sqrt(np.mean(iota_tar**2)) + 1e-14)
+        return {
+            "rho": self.rho.copy(),
+            "iota_target": iota_tar,
+            "iota_recon": iota_est,
+            "rmse": float(rmse),
+            "rel_rmse": float(rel),
+            "Phip_recon": Phip_est,
+            "psip_recon": psip_est,
+        }
+
+    def metric_toroidal_flux_error(self, x_core, pressure_scale_factor=1.0):
+        iota_data = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
+        Phip_est = iota_data["Phip_recon"]
+        phi_est = np.zeros_like(Phip_est)
+        for i in range(1, len(self.rho)):
+            dr = self.rho[i] - self.rho[i - 1]
+            phi_est[i] = phi_est[i - 1] + 0.5 * (Phip_est[i] + Phip_est[i - 1]) * dr
+        edge_abs = abs(phi_est[-1] - self.Phi_a)
+        edge_rel = edge_abs / (abs(self.Phi_a) + 1e-14)
+        phi_target = self.Phi_a * self.rho**2
+        return {
+            "rho": self.rho.copy(),
+            "Phi_target": phi_target,
+            "Phi_recon": phi_est,
+            "edge_abs_error": float(edge_abs),
+            "edge_rel_error": float(edge_rel),
+        }
+
+    def metric_poloidal_flux_error(self, x_core, pressure_scale_factor=1.0):
+        iota_data = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
+        psip_est = iota_data["psip_recon"]
+        psi_est = np.zeros_like(psip_est)
+        for i in range(1, len(self.rho)):
+            dr = self.rho[i] - self.rho[i - 1]
+            psi_est[i] = psi_est[i - 1] + 0.5 * (psip_est[i] + psip_est[i - 1]) * dr
+        psi_target = self.compute_psi(self.rho)
+        edge_abs = abs(psi_est[-1] - psi_target[-1])
+        edge_rel = edge_abs / (abs(psi_target[-1]) + 1e-14)
+        rmse = np.sqrt(np.mean((psi_est - psi_target) ** 2))
+        return {
+            "rho": self.rho.copy(),
+            "Psi_target": psi_target,
+            "Psi_recon": psi_est,
+            "edge_abs_error": float(edge_abs),
+            "edge_rel_error": float(edge_rel),
+            "rmse": float(rmse),
+        }
+
+    def metric_global_energy_terms(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w = self._volume_weights(s)
+        B2 = s["Bt_sup"] * s["Bt_sub"] + s["Bz_sup"] * s["Bz_sub"]
+        magnetic_energy = 0.5 / self.mu_0 * np.sum(w * B2)
+        pressure_energy = np.sum(w * s["P"])
+        total_energy = magnetic_energy + pressure_energy
+        return {
+            "magnetic_energy": float(magnetic_energy),
+            "pressure_energy": float(pressure_energy),
+            "total_energy": float(total_energy),
+        }
+
+    def metric_spectral_tail_ratio(self, x_core):
+        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
+
+        def tail_ratio(arr):
+            if arr.shape[0] < 2:
+                return 0.0
+            e_all = np.sum(arr**2)
+            e_tail = np.sum(arr[-1:, :] ** 2)
+            return float(e_tail / (e_all + 1e-14))
+
+        ratios = {
+            "c0R_tail": tail_ratio(c_c0R),
+            "c0Z_tail": tail_ratio(c_c0Z),
+            "h_tail": tail_ratio(c_h),
+            "v_tail": tail_ratio(c_v),
+            "k_tail": tail_ratio(c_k),
+            "a_tail": tail_ratio(c_a),
+            "tR_tail": tail_ratio(c_tR) if self.len_2d > 0 else 0.0,
+            "tZ_tail": tail_ratio(c_tZ) if self.len_2d > 0 else 0.0,
+            "lam_tail": tail_ratio(c_lam) if self.len_lam > 0 else 0.0,
+        }
+        ratios["max_tail_ratio"] = float(max(ratios.values()) if len(ratios) > 0 else 0.0)
+        return ratios
+
+    def metric_residual_drop_history(self):
+        hist = np.array(getattr(self, "_all_eval_history", []), dtype=float)
+        if hist.size == 0:
+            return {"history": hist, "drop_ratio": np.nan, "final": np.nan}
+        drop_ratio = hist[-1] / (hist[0] + 1e-14)
+        return {"history": hist, "drop_ratio": float(drop_ratio), "final": float(hist[-1])}
+
+    def metric_conditioning_proxy(self, x_core, pressure_scale_factor=1.0):
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+
+        @jax.jit
+        def fun_wrapped(x_arr):
+            return jax_res_fn(x_arr, apply_scaling=True)
+
+        @jax.jit
+        def jac_wrapped(x_arr):
+            return jax.jacfwd(fun_wrapped)(x_arr)
+
+        J = np.array(jac_wrapped(jnp.array(x_core)))
+        col_norms = np.linalg.norm(J, axis=0)
+        min_col = np.min(col_norms) + 1e-14
+        max_col = np.max(col_norms)
+        try:
+            svals = np.linalg.svd(J, compute_uv=False)
+            cond = float(svals[0] / (svals[-1] + 1e-14))
+            smin = float(svals[-1])
+            smax = float(svals[0])
+        except Exception:
+            cond = np.inf
+            smin = np.nan
+            smax = np.nan
+        return {
+            "column_norm_ratio": float(max_col / min_col),
+            "svd_condition_est": cond,
+            "svd_smin": smin,
+            "svd_smax": smax,
+        }
+
+    def metric_resolution_convergence(self, x_core, pressure_scale_factor=1.0, levels=None):
+        if levels is None:
+            levels = [
+                (max(10, self.target_Nr - 6), max(10, self.target_Nt - 6), max(10, self.target_Nz - 6)),
+                (max(12, self.target_Nr - 2), max(12, self.target_Nt - 2), max(12, self.target_Nz - 2)),
+                (self.target_Nr, self.target_Nt, self.target_Nz),
+            ]
+        old = (self.Nr, self.Nt_grid, self.Nz_grid)
+        results = []
+        for Nr, Nt, Nz in levels:
+            self.update_grid(int(Nr), int(Nt), int(Nz))
+            fb = self.metric_force_balance_rel(x_core, pressure_scale_factor)
+            db = self.metric_divB_rel(x_core, pressure_scale_factor)
+            js = self.metric_jacobian_stats(x_core, pressure_scale_factor)
+            results.append({
+                "Nr": self.Nr,
+                "Nt": self.Nt_grid,
+                "Nz": self.Nz_grid,
+                "force_balance_rel": fb,
+                "divB_rel": db,
+                "det_min": js["min"],
+            })
+        self.update_grid(*old)
+        return results
+
+    def _print_scalar_metric(self, name, value, target_text):
+        print(f"    - {name:<32}: {value:>12.6e} | 目标最优值: {target_text}")
+
+    def run_validation_suite(self, x_core, pressure_scale_factor=1.0):
+        print("\n" + "=" * 70)
+        print(">>> 运行平衡正确性验证指标套件")
+        print("=" * 70)
+
+        fb_l2 = self.metric_force_balance_L2(x_core, pressure_scale_factor)
+        fb_rel = self.metric_force_balance_rel(x_core, pressure_scale_factor)
+        db_l2 = self.metric_divB_L2(x_core, pressure_scale_factor)
+        db_rel = self.metric_divB_rel(x_core, pressure_scale_factor)
+        jac_stats = self.metric_jacobian_stats(x_core, pressure_scale_factor)
+        jcl = self.metric_current_closure_L2(x_core, pressure_scale_factor)
+        axis = self.metric_axis_location(x_core)
+        prof = self.metric_profile_reconstruction_error(x_core, pressure_scale_factor)
+        iota_m = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
+        phi_m = self.metric_toroidal_flux_error(x_core, pressure_scale_factor)
+        psi_m = self.metric_poloidal_flux_error(x_core, pressure_scale_factor)
+        en_m = self.metric_global_energy_terms(x_core, pressure_scale_factor)
+        tail = self.metric_spectral_tail_ratio(x_core)
+        hist = self.metric_residual_drop_history()
+        cond = self.metric_conditioning_proxy(x_core, pressure_scale_factor)
+        conv = self.metric_resolution_convergence(x_core, pressure_scale_factor)
+
+        print(">>> 标量指标（直接数值 + 目标最优值）")
+        self._print_scalar_metric("force_balance_L2", fb_l2, "0 (越小越好)")
+        self._print_scalar_metric("force_balance_rel", fb_rel, "0 (越小越好)")
+        self._print_scalar_metric("divB_L2", db_l2, "0 (越小越好)")
+        self._print_scalar_metric("divB_rel", db_rel, "0 (越小越好)")
+        self._print_scalar_metric("current_closure_L2", jcl, "0 (越小越好)")
+        self._print_scalar_metric("det_phys_min", jac_stats["min"], "> 0 (越大越安全)")
+        self._print_scalar_metric("det_phys_negative_fraction", jac_stats["negative_fraction"], "0 (越小越好)")
+        self._print_scalar_metric("det_eff_min", jac_stats["eff_min"], "> 0 (越大越安全)")
+        self._print_scalar_metric("det_eff_negative_fraction", jac_stats["eff_negative_fraction"], "0 (越小越好)")
+        self._print_scalar_metric("axis_R_std", axis["R_std"], "0 (越小越好)")
+        self._print_scalar_metric("axis_Z_std", axis["Z_std"], "0 (越小越好)")
+        self._print_scalar_metric("profile_rmse", prof["rmse"], "0 (越小越好)")
+        self._print_scalar_metric("profile_rel_rmse", prof["rel_rmse"], "0 (越小越好)")
+        self._print_scalar_metric("iota_rmse", iota_m["rmse"], "0 (越小越好)")
+        self._print_scalar_metric("iota_rel_rmse", iota_m["rel_rmse"], "0 (越小越好)")
+        self._print_scalar_metric("phi_edge_abs_error", phi_m["edge_abs_error"], "0 (越小越好)")
+        self._print_scalar_metric("phi_edge_rel_error", phi_m["edge_rel_error"], "0 (越小越好)")
+        self._print_scalar_metric("psi_edge_abs_error", psi_m["edge_abs_error"], "0 (越小越好)")
+        self._print_scalar_metric("psi_edge_rel_error", psi_m["edge_rel_error"], "0 (越小越好)")
+        self._print_scalar_metric("psi_profile_rmse", psi_m["rmse"], "0 (越小越好)")
+        self._print_scalar_metric("magnetic_energy", en_m["magnetic_energy"], "有限正值 (物理可接受)")
+        self._print_scalar_metric("pressure_energy", en_m["pressure_energy"], "有限值 (与剖面一致)")
+        self._print_scalar_metric("total_energy", en_m["total_energy"], "有限正值")
+        self._print_scalar_metric("spectral_max_tail_ratio", tail["max_tail_ratio"], "接近 0 (越小越好)")
+        self._print_scalar_metric("residual_drop_ratio", hist["drop_ratio"], "接近 0 (越小越好)")
+        self._print_scalar_metric("residual_final", hist["final"], "接近 0 (越小越好)")
+        self._print_scalar_metric("conditioning_col_ratio", cond["column_norm_ratio"], "尽可能小")
+        self._print_scalar_metric("conditioning_svd_est", cond["svd_condition_est"], "尽可能小")
+
+        fig = plt.figure(figsize=(16, 14))
+        gs = fig.add_gridspec(3, 2)
+
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.plot(axis["zeta"], axis["R_axis"], label="R_axis(zeta)")
+        ax1.plot(axis["zeta"], axis["Z_axis"], label="Z_axis(zeta)")
+        ax1.set_title("Axis location vs zeta")
+        ax1.set_xlabel("zeta")
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.plot(prof["rho"], prof["P_target"], label="P target")
+        ax2.plot(prof["rho"], prof["P_recon"], "--", label="P recon")
+        ax2.plot(prof["rho"], prof["dP_target"], label="dP/drho target")
+        ax2.plot(prof["rho"], prof["dP_recon"], "--", label="dP/drho recon")
+        ax2.set_title("Profile reconstruction")
+        ax2.set_xlabel("rho")
+        ax2.legend(fontsize="small")
+        ax2.grid(alpha=0.3)
+
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.plot(iota_m["rho"], iota_m["iota_target"], label="iota target")
+        ax3.plot(iota_m["rho"], iota_m["iota_recon"], "--", label="iota recon")
+        ax3.set_title("Rotational transform")
+        ax3.set_xlabel("rho")
+        ax3.legend()
+        ax3.grid(alpha=0.3)
+
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.plot(phi_m["rho"], phi_m["Phi_target"], label="Phi target")
+        ax4.plot(phi_m["rho"], phi_m["Phi_recon"], "--", label="Phi recon")
+        ax4.plot(psi_m["rho"], psi_m["Psi_target"], label="Psi target")
+        ax4.plot(psi_m["rho"], psi_m["Psi_recon"], "--", label="Psi recon")
+        ax4.set_title("Flux consistency")
+        ax4.set_xlabel("rho")
+        ax4.legend(fontsize="small")
+        ax4.grid(alpha=0.3)
+
+        ax5 = fig.add_subplot(gs[2, 0])
+        if hist["history"].size > 0:
+            ax5.semilogy(np.arange(len(hist["history"])), hist["history"], label="||res||")
+        ax5.set_title("Residual drop history")
+        ax5.set_xlabel("function eval index")
+        ax5.legend()
+        ax5.grid(alpha=0.3)
+
+        ax6 = fig.add_subplot(gs[2, 1])
+        labels = [k for k in tail.keys() if k != "max_tail_ratio"]
+        vals = [tail[k] for k in labels]
+        ax6.bar(np.arange(len(labels)), vals)
+        ax6.set_xticks(np.arange(len(labels)))
+        ax6.set_xticklabels(labels, rotation=45, ha="right")
+        ax6.set_title("Spectral tail ratios")
+        ax6.grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        fig2, (bx1, bx2) = plt.subplots(1, 2, figsize=(14, 5))
+        grids = [f"{c['Nr']}x{c['Nt']}x{c['Nz']}" for c in conv]
+        bx1.semilogy(grids, [c["force_balance_rel"] for c in conv], marker="o", label="force_balance_rel")
+        bx1.semilogy(grids, [c["divB_rel"] for c in conv], marker="s", label="divB_rel")
+        bx1.set_title("Resolution convergence (relative residuals)")
+        bx1.set_xlabel("grid")
+        bx1.legend()
+        bx1.grid(alpha=0.3)
+
+        bx2.plot(grids, [c["det_min"] for c in conv], marker="^", color="tab:red")
+        bx2.set_title("Resolution convergence (det_phys min)")
+        bx2.set_xlabel("grid")
+        bx2.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        print("=" * 70 + "\n")
 
     def solve(self):
         print(">>> 启动 VEQ-3D 谱精度平衡求解器 (奇点相消无障碍版)...")
         
         def make_even(x): return x + (x % 2)
-        c_Nr = make_even(max(10, 4 * self.L_rad + 2))
-        c_Nt = make_even(max(12, 4 * self.M_pol + 4))
-        c_Nz = make_even(max(8, 4 * self.N_tor + 2))
+        # 预设候选分辨率
+        c_Nr_raw = make_even(max(10, 4 * self.L_rad + 2))
+        c_Nt_raw = make_even(max(12, 4 * self.M_pol + 4))
+        c_Nz_raw = make_even(max(8, 4 * self.N_tor + 2))
+        m_Nr_raw = make_even(c_Nr_raw + 4)
+        m_Nt_raw = make_even(c_Nt_raw + 6)
+        m_Nz_raw = make_even(c_Nz_raw + 4)
 
-        m_Nr = make_even(c_Nr + 4)
-        m_Nt = make_even(c_Nt + 6)
-        m_Nz = make_even(c_Nz + 4)
+        # 高网格作为上界，强制满足 low <= mid <= high（逐维）
+        h_Nr = make_even(max(4, int(self.target_Nr)))
+        h_Nt = make_even(max(4, int(self.target_Nt)))
+        h_Nz = make_even(max(4, int(self.target_Nz)))
+
+        m_Nr = min(m_Nr_raw, h_Nr)
+        m_Nt = min(m_Nt_raw, h_Nt)
+        m_Nz = min(m_Nz_raw, h_Nz)
+
+        c_Nr = min(c_Nr_raw, m_Nr)
+        c_Nt = min(c_Nt_raw, m_Nt)
+        c_Nz = min(c_Nz_raw, m_Nz)
+
+        phase_total_start_time = time.time()
 
         print("\n" + "="*70)
         print(f">>> [Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
         print("="*70)
         self.update_grid(c_Nr, c_Nt, c_Nz)
         x_guess = np.zeros(self.num_core_params)
+        self._all_eval_history = []
         
         res_phase1 = self._run_optimization(x_guess, max_nfev=200, ftol=1e-3, pressure_scale_factor=0.0)
+        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
         print(f">>> [Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
@@ -511,22 +1294,33 @@ class VEQ3D_Solver:
         self.update_grid(m_Nr, m_Nt, m_Nz)
         
         res_phase2 = self._run_optimization(res_phase1.x, max_nfev=300, ftol=1e-5, pressure_scale_factor=0.1)
+        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
-        print(f">>> [Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={self.target_Nr}, Nt={self.target_Nt}, Nz={self.target_Nz}, P=1.0)")
+        print(f">>> [Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
         print("="*70)
-        self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
+        self.update_grid(h_Nr, h_Nt, h_Nz)
         
         res_fine = self._run_optimization(res_phase2.x, max_nfev=800, ftol=1e-12, pressure_scale_factor=1.0)
+        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
+        phase_total_end_time = time.time()
+
+        total_nfev = int(res_phase1.nfev + res_phase2.nfev + res_fine.nfev)
+        print("\n" + "=" * 70)
+        print(">>> 三阶段收敛总耗时统计:")
+        print(f"    总耗时(Phase 1~3, 至收敛): {phase_total_end_time - phase_total_start_time:.2f} s")
+        print(f"    总函数计算次数(nfev):       {total_nfev}")
+        print("=" * 70)
 
         self.print_final_parameters(res_fine.x)
         self.plot_equilibrium(res_fine.x)
+        self.run_validation_suite(res_fine.x, pressure_scale_factor=1.0)
         return res_fine.x
 
     def compute_geometry(self, x_core, rho, theta, zeta):
         rho, theta, zeta = np.atleast_1d(rho), np.atleast_1d(theta), np.atleast_1d(zeta)
         base_grid = rho + theta + zeta
-        x = 2.0 * rho**2 - 1.0
+        x = 2.0 * rho**2 - 1.0  # ψ_N = ρ²
         T = np.zeros((self.L_rad,) + x.shape)
         if self.L_rad > 0: T[0] = 1.0
         if self.L_rad > 1: T[1] = x
@@ -590,7 +1384,7 @@ class VEQ3D_Solver:
         print("-" * table_width)
         
         header_cols = [f"Chebyshev L={L} 演化系数" for L in range(self.L_rad)]
-        header_str = f"{'参数标识':<15} | {'Edge 边界常量 (rho=1)':<25} | " + " | ".join([f"{h:<22}" for h in header_cols])
+        header_str = f"{'参数标识':<15} | {'Edge (ρ=1, ψ_N=1)':<25} | " + " | ".join([f"{h:<22}" for h in header_cols])
         print(header_str)
         print("-" * table_width)
         
@@ -627,16 +1421,48 @@ class VEQ3D_Solver:
                 print(L_str)
         print("=" * table_width + "\n")
 
+    def _wrap_to_2pi(self, ang):
+        return np.mod(np.asarray(ang, dtype=float), 2 * np.pi)
+
+    def _angle_distance(self, a, b):
+        da = self._wrap_to_2pi(a) - self._wrap_to_2pi(b)
+        return np.abs((da + np.pi) % (2 * np.pi) - np.pi)
+
+    def _desc_phi_to_solver_zeta(self, phi_like):
+        """
+        DESC 对比数据第三列统一转换层：
+        约定文件列是 phi（即使列名写成 zeta），统一映射为求解器内部 zeta = N_fp * phi。
+        """
+        phi_arr = np.asarray(phi_like, dtype=float)
+        # 使用原位运算减少临时数组，降低大数据量转换耗时
+        np.multiply(phi_arr, self.N_fp, out=phi_arr)
+        np.remainder(phi_arr, 2 * np.pi, out=phi_arr)
+        return phi_arr
+
     def plot_equilibrium(self, x_core):
         import os
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
         
         # 尝试加载 DESC 的对比数据
         desc_data = None
-        if os.path.exists("RZ_data.csv"):
+        unique_zetas = None
+        zeta_match_tol = 0.1
+        if os.path.exists("RZ_data.txt"):
             try:
-                desc_data = np.loadtxt("RZ_data.csv", delimiter=',', skiprows=1)
-                print("    >>> 成功加载 DESC 对比数据 RZ_data.csv")
+                t0 = time.time()
+                desc_data = np.loadtxt("RZ_data.txt", delimiter=',', skiprows=1)
+                t1 = time.time()
+                # 统一将第三列角度转换为求解器内部 zeta
+                desc_data[:, 2] = self._desc_phi_to_solver_zeta(desc_data[:, 2])
+                t2 = time.time()
+                unique_zetas = np.unique(desc_data[:, 2])
+                if len(unique_zetas) > 1:
+                    zeta_step = np.min(np.diff(unique_zetas))
+                    # 自适应阈值：至少覆盖半个离散步长，避免 zeta=pi 这类临界漏匹配
+                    zeta_match_tol = max(0.1, 0.55 * zeta_step)
+                print("    >>> 成功加载 DESC 对比数据 RZ_data.txt")
+                print("    >>> 已应用角度统一转换: zeta = N_fp * phi (mod 2pi)")
+                print(f"    >>> DESC 数据读取耗时: {t1 - t0:.3f} s | 角度转换耗时: {t2 - t1:.3f} s")
             except Exception as e:
                 print(f"    >>> 无法加载 DESC 数据: {e}")
 
@@ -644,6 +1470,13 @@ class VEQ3D_Solver:
         axes = axes.flatten()
         rp = np.linspace(0, 1, 50); tp = np.linspace(0, 2*np.pi, 100)
         R_P, T_P = np.meshgrid(rp, tp); PSI_P = self.compute_psi(R_P)
+        
+        # 与 DESC 数据对比误差累计量
+        total_squared_error = 0.0
+        total_matched_points = 0
+        total_squared_true = 0.0
+        total_sum_true_r = 0.0
+        total_sum_true_z = 0.0
         for i, zv in enumerate(zetas):
             ax = axes[i]; Rm, Zm = [], []
             for r, t in zip(R_P.flatten(), T_P.flatten()):
@@ -658,7 +1491,10 @@ class VEQ3D_Solver:
                 ax.plot(rl, zl, color='white', lw=1.0, alpha=0.5, label='VEQ3D Surfaces' if r_lev == 1.0 and i == 0 else "")
             
             th_t = np.linspace(0, 2*np.pi, 200)
-            ax.plot(10 - np.cos(th_t) - 0.3*np.cos(th_t + zv), np.sin(th_t) - 0.3*np.sin(th_t + zv), 'r--', lw=1.5, label='Input LCFS')
+            ze_line = np.full_like(th_t, zv)
+            r_lcfs = np.asarray(self._boundary_R_fn(th_t, ze_line), dtype=float)
+            z_lcfs = np.asarray(self._boundary_Z_fn(th_t, ze_line), dtype=float)
+            ax.plot(r_lcfs, z_lcfs, 'r--', lw=1.5, label='Input LCFS')
             
             rl_e, zl_e = self.compute_geometry(x_core, 1.0, np.linspace(0, 2*np.pi, 100), zv)[:2]
             ax.plot(rl_e, zl_e, color='#FFD700', lw=2.0, label='VEQ3D Boundary')
@@ -666,22 +1502,15 @@ class VEQ3D_Solver:
             # ==========================================
             # 叠加绘制 DESC 结果
             # ==========================================
-            if desc_data is not None:
-                unique_zetas = np.unique(desc_data[:, 2])
+            if desc_data is not None and unique_zetas is not None:
                 if len(unique_zetas) > 0:
-                    # 兼容场周期角 (zv) 和物理几何环向角 (zv / N_fp) 的匹配
-                    err_field = np.abs(unique_zetas - zv)
-                    err_geom = np.abs(unique_zetas - (zv / self.N_fp))
+                    # 统一转换后，仅按求解器 zeta 直接匹配
+                    err_field = self._angle_distance(unique_zetas, zv)
+                    closest_zv = unique_zetas[np.argmin(err_field)]  # 该值来自 DESC 原始切片
                     
-                    if np.min(err_field) < 0.1:
-                        closest_zv = unique_zetas[np.argmin(err_field)]
-                    elif np.min(err_geom) < 0.01:
-                        closest_zv = unique_zetas[np.argmin(err_geom)]
-                    else:
-                        closest_zv = None
-                    
-                    if closest_zv is not None:
-                        slice_data = desc_data[np.abs(desc_data[:, 2] - closest_zv) < 1e-5]
+                    if np.min(err_field) <= zeta_match_tol:
+                        # 严格使用 DESC 文件中“完全相等”的 zeta 切片数据
+                        slice_data = desc_data[desc_data[:, 2] == closest_zv]
                         unique_rhos = np.unique(slice_data[:, 0])
                         
                         # 只绘制特定的 rho 层
@@ -701,12 +1530,47 @@ class VEQ3D_Solver:
                                     # 闭合曲线处理
                                     r_plot = np.append(r_data[:, 3], r_data[0, 3])
                                     z_plot = np.append(r_data[:, 4], r_data[0, 4])
-                                    ax.plot(r_plot, z_plot, color='cyan', linestyle=':', lw=1.5, 
+                                    # 暂时关闭 DESC 叠加可视化输出（保留误差统计）
+                                    ax.plot(r_plot, z_plot, color='cyan', linestyle=':', lw=1.5,
                                             label='DESC Data' if r_target == 1.0 and i == 0 else "")
+                                    
+                                    # 统计该层对应点上的误差（按 DESC 给定 theta 逐点比较）
+                                    th_desc = r_data[:, 1]
+                                    R_desc = r_data[:, 3]
+                                    Z_desc = r_data[:, 4]
+                                    # 统计点使用 DESC 切片的精确 zeta，保证 zeta 完全相等
+                                    R_calc, Z_calc, _, _, _, _, _ = self.compute_geometry(x_core, r_val, th_desc, closest_zv)
+                                    
+                                    total_squared_error += np.sum((R_calc - R_desc)**2 + (Z_calc - Z_desc)**2)
+                                    total_matched_points += len(th_desc)
+                                    total_squared_true += np.sum(R_desc**2 + Z_desc**2)
+                                    total_sum_true_r += np.sum(R_desc)
+                                    total_sum_true_z += np.sum(Z_desc)
             # ==========================================
 
-            ax.set_aspect('equal'); ax.set_title(f'Field Period Angle $\zeta={zv:.2f}$') 
+            ax.set_aspect('equal'); ax.set_title(fr'Field Period Angle $\zeta={zv:.2f}$')
+            ax.set_xlabel('R (m)')
+            ax.set_ylabel('Z (m)')
             if i == 0: ax.legend(loc='upper right', fontsize='xx-small')
+
+        # 输出 RMSE 与两类相对误差
+        if desc_data is not None and total_matched_points > 0:
+            rmse = np.sqrt(total_squared_error / total_matched_points)
+            rms_true = np.sqrt(total_squared_true / total_matched_points)
+            rel_err_l2 = rmse / rms_true if rms_true > 0 else 0.0
+
+            mean_r = total_sum_true_r / total_matched_points
+            mean_z = total_sum_true_z / total_matched_points
+            mean_dist = np.sqrt(mean_r**2 + mean_z**2)
+            rel_err_mean = rmse / mean_dist if mean_dist > 0 else 0.0
+
+            print("\n" + "="*70)
+            print(">>> 与 DESC 数据对比的误差统计:")
+            print(f"    绝对均方根误差 (RMSE): {rmse:.6e}")
+            print(f"    L2 相对误差:           {rel_err_l2:.6e} ({rel_err_l2*100:.4f}%)")
+            print(f"    基于均值的相对误差:    {rel_err_mean:.6e} ({rel_err_mean*100:.4f}%)")
+            print(f"    (基于统计的共计 {total_matched_points} 个对应网格点)")
+            print("="*70 + "\n")
         plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
