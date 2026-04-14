@@ -298,6 +298,37 @@ class VEQ3D_Solver:
             offset += size
         return stats
 
+    def _build_continuation_freeze_mask(self, max_m=1, max_n=1, max_l=3):
+        """构造递进求解冻结掩码：Phase1/2 仅保留低阶自由度。"""
+        mask = np.zeros(self.num_core_params, dtype=bool)
+        one_d_modes = self._one_d_mode_map()
+        for block_name, offset, width in self._iter_core_blocks():
+            if width == 0:
+                continue
+            block_mask = mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            # 先冻结高径向阶：仅保留 L=0...(max_l-1)
+            if max_l < self.L_rad:
+                block_mask[max_l:, :] = True
+            # 再冻结高 m/n 阶
+            if block_name in ("c0R", "c0Z", "h", "v", "k", "a"):
+                for mode_key, j in one_d_modes.items():
+                    if mode_key == (0, "0"):
+                        n_mode = 0
+                    else:
+                        n_mode, _ = mode_key
+                    if abs(n_mode) > max_n:
+                        block_mask[:, j] = True
+            elif block_name in ("tR", "tZ"):
+                for j, (m_mode, n_mode, _) in enumerate(self.modes_2d):
+                    if (m_mode > max_m) or (abs(n_mode) > max_n):
+                        block_mask[:, j] = True
+            elif block_name == "lam":
+                lam_m_cap = max_m + 1
+                for j, (m_mode, n_mode) in enumerate(self.lambda_modes):
+                    if (m_mode > lam_m_cap) or (abs(n_mode) > max_n):
+                        block_mask[:, j] = True
+        return mask
+
     def _build_prefilter_freeze_mask(self, pilot_solver, pilot_x_core, tol=1e-6):
         full_mask = np.zeros(self.num_core_params, dtype=bool)
         full_vals = np.zeros(self.num_core_params, dtype=float)
@@ -1184,9 +1215,31 @@ class VEQ3D_Solver:
         proj_max_backtracks = int(proj_cfg.get("projection_max_backtracks", 4))
         adaptive_chunk_growth = float(proj_cfg.get("adaptive_chunk_growth", 1.5))
         adaptive_chunk_cap = int(proj_cfg.get("adaptive_chunk_cap", max_nfev))
+        residual_oversample_factor = float(proj_cfg.get("residual_oversample_factor", 1.5))
+        anneal_factor = float(proj_cfg.get("anneal_factor", 0.5))
+        anneal_min_regularization = float(proj_cfg.get("anneal_min_regularization", 1e-4))
+        anneal_max_steps = int(proj_cfg.get("anneal_max_steps", 6))
+        nominal_grid = (int(self.Nr), int(self.Nt_grid), int(self.Nz_grid))
+        eval_grid = nominal_grid
+        if residual_oversample_factor > 1.0:
+            Nr_e = max(nominal_grid[0] + 2, int(np.ceil(nominal_grid[0] * residual_oversample_factor)))
+            Nt_e = max(nominal_grid[1] + 2, int(np.ceil(nominal_grid[1] * residual_oversample_factor)))
+            Nz_e = max(nominal_grid[2] + 2, int(np.ceil(nominal_grid[2] * residual_oversample_factor)))
+            Nr_e += Nr_e % 2
+            Nt_e += Nt_e % 2
+            Nz_e += Nz_e % 2
+            eval_grid = (Nr_e, Nt_e, Nz_e)
+        if eval_grid != nominal_grid:
+            self.update_grid(*eval_grid)
         
         start_time = time.time()
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
+        if eval_grid != nominal_grid:
+            print(
+                "    >>> 残差评估过采样: "
+                f"优化网格 {nominal_grid[0]}x{nominal_grid[1]}x{nominal_grid[2]} -> "
+                f"评估网格 {eval_grid[0]}x{eval_grid[1]}x{eval_grid[2]}"
+            )
         print(f"    >>> 雅可比模式: {'JAX 精确雅可比' if use_exact_jacobian else 'SciPy 2-point 数值雅可比'}")
         eval_hist = []
         self._last_eval_history = eval_hist
@@ -1206,15 +1259,29 @@ class VEQ3D_Solver:
             x_full[active_idx] = np.asarray(x_active, dtype=float)
             return x_full
 
-        @jax.jit
-        def fun_active_wrapped(x_active_arr):
-            x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
-            x_full = x_full.at[active_idx_jnp].set(x_active_arr)
-            return jax_res_fn(x_full, apply_scaling=True)
+        fun_active_wrapped = None
+        jac_active_wrapped = None
+        anneal_steps = 0
+        regularization_scale_curr = float(self.regularization_scale)
 
-        @jax.jit
-        def jac_active_wrapped(x_active_arr):
-            return jax.jacfwd(fun_active_wrapped)(x_active_arr)
+        def rebuild_residual_operators():
+            nonlocal jax_res_fn, fun_active_wrapped, jac_active_wrapped
+            jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+
+            @jax.jit
+            def _fun_active_wrapped(x_active_arr):
+                x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
+                x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+                return jax_res_fn(x_full, apply_scaling=True)
+
+            @jax.jit
+            def _jac_active_wrapped(x_active_arr):
+                return jax.jacfwd(_fun_active_wrapped)(x_active_arr)
+
+            fun_active_wrapped = _fun_active_wrapped
+            jac_active_wrapped = _jac_active_wrapped
+
+        rebuild_residual_operators()
 
         def fun_logged(x_arr):
             r = np.array(fun_active_wrapped(jnp.array(x_arr)))
@@ -1326,9 +1393,20 @@ class VEQ3D_Solver:
                             "    >>> [ProximalProjection] 拒绝本轮投影："
                             f"FB_L2 劣化超过阈值 {proj_max_force_degrade_ratio:.2f}，保持纯物理步结果。"
                         )
+                        if anneal_steps < anneal_max_steps:
+                            new_scale = max(regularization_scale_curr * anneal_factor, anneal_min_regularization)
+                            if new_scale < regularization_scale_curr - 1e-15:
+                                regularization_scale_curr = new_scale
+                                self.regularization_scale = regularization_scale_curr
+                                anneal_steps += 1
+                                rebuild_residual_operators()
+                                print(
+                                    "    >>> [Anneal] 投影被拒绝，退火几何正则权重: "
+                                    f"regularization_scale -> {regularization_scale_curr:.3e}"
+                                )
 
             fb_l2_now = self.metric_force_balance_L2(x_curr, pressure_scale_factor)
-            fb_rel_now = self.metric_force_balance_rel(x_curr, pressure_scale_factor)
+            fb_rel_now = 0.0 if disable_rel_criterion else self.metric_force_balance_rel(x_curr, pressure_scale_factor)
             if disable_rel_criterion:
                 print(
                     "    >>> [硬收敛判据] force_balance_L2="
@@ -1352,18 +1430,31 @@ class VEQ3D_Solver:
                     "    >>> [继续迭代] 优化器触发 ftol/xtol 但未过硬物理阈值，"
                     f"下一轮放宽步预算至 {chunk_nfev_curr}。"
                 )
+                if anneal_steps < anneal_max_steps:
+                    new_scale = max(regularization_scale_curr * anneal_factor, anneal_min_regularization)
+                    if new_scale < regularization_scale_curr - 1e-15:
+                        regularization_scale_curr = new_scale
+                        self.regularization_scale = regularization_scale_curr
+                        anneal_steps += 1
+                        rebuild_residual_operators()
+                        print(
+                            "    >>> [Anneal] 卡死区退火: "
+                            f"regularization_scale -> {regularization_scale_curr:.3e}"
+                        )
 
             outer += 1
 
         end_time = time.time()
         if res is None:
+            if eval_grid != nominal_grid:
+                self.update_grid(*nominal_grid)
             raise RuntimeError("优化未执行：max_nfev 预算不足")
         res.x = x_curr
         res.nfev = total_nfev
         phys_res_final = jax_res_fn(jnp.array(x_curr), apply_scaling=True)
         phys_len = self.num_core_params 
         phys_res_only = phys_res_final[:phys_len]
-        fb_rel_final = self.metric_force_balance_rel(x_curr, pressure_scale_factor)
+        fb_rel_final = 0.0 if disable_rel_criterion else self.metric_force_balance_rel(x_curr, pressure_scale_factor)
         fb_l2_final = self.metric_force_balance_L2(x_curr, pressure_scale_factor)
         
         print(f"    当前网格总耗时: {end_time - start_time:.2f} s | 总函数计算: {total_nfev} 次")
@@ -1378,6 +1469,8 @@ class VEQ3D_Solver:
             print("    >>> 硬物理阈值已满足，允许结束当前阶段优化。")
         else:
             print("    >>> 注意：当前阶段结束时尚未满足硬物理阈值（受预算/外循环上限约束）。")
+        if eval_grid != nominal_grid:
+            self.update_grid(*nominal_grid)
         
         return res
 
@@ -2315,6 +2408,20 @@ class VEQ3D_Solver:
         self._all_eval_history = []
         x0 = np.zeros(self.num_core_params) if x_guess is None else np.asarray(x_guess, dtype=float)
         x0 = self._apply_fixed_core(x0)
+        base_fixed_mask = self.core_fixed_mask.copy()
+        base_fixed_vals = self.core_fixed_values.copy()
+        continuation_mask = self._build_continuation_freeze_mask(max_m=1, max_n=1, max_l=3)
+
+        phase12_mask = base_fixed_mask | continuation_mask
+        phase12_vals = base_fixed_vals.copy()
+        phase12_vals[continuation_mask & (~base_fixed_mask)] = 0.0
+        self.core_fixed_mask = phase12_mask
+        self.core_fixed_values = phase12_vals
+        n_fixed_p12 = int(np.sum(self.core_fixed_mask))
+        print(
+            ">>> 递进冻结策略启用 (Phase1/2): "
+            f"固定 {n_fixed_p12}/{self.num_core_params} 个参数，仅释放低阶(M<=1, |N|<=1, L<=3)。"
+        )
 
         print("\n" + "="*70)
         print(f">>> {phase_title_prefix}[Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
@@ -2342,6 +2449,10 @@ class VEQ3D_Solver:
             "force_component_scale_floor": 1e-10,
             "force_balance_abs_tol": 1e-2,
             "disable_rel_criterion": True,
+            "residual_oversample_factor": 1.5,
+            "anneal_factor": 0.5,
+            "anneal_min_regularization": 1e-4,
+            "anneal_max_steps": 6,
         }
         res_phase1 = self._run_optimization(
             x0,
@@ -2381,6 +2492,10 @@ class VEQ3D_Solver:
             "projection_max_force_degrade_ratio": 0.15,
             "projection_backtrack_shrink": 0.5,
             "projection_max_backtracks": 5,
+            "residual_oversample_factor": 1.5,
+            "anneal_factor": 0.5,
+            "anneal_min_regularization": 1e-4,
+            "anneal_max_steps": 6,
         }
         res_phase2 = self._run_optimization(
             res_phase1.x,
@@ -2390,6 +2505,13 @@ class VEQ3D_Solver:
             projection_cfg=proj_phase2,
         )
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
+        self.core_fixed_mask = base_fixed_mask.copy()
+        self.core_fixed_values = base_fixed_vals.copy()
+        n_fixed_p3 = int(np.sum(self.core_fixed_mask))
+        print(
+            ">>> 进入 Phase3：解冻高阶自由度，继承低阶收敛初值。"
+            f" 当前固定参数 {n_fixed_p3}/{self.num_core_params}。"
+        )
 
         print("\n" + "="*70)
         print(f">>> {phase_title_prefix}[Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
@@ -2420,6 +2542,10 @@ class VEQ3D_Solver:
             "projection_max_force_degrade_ratio": 0.10,
             "projection_backtrack_shrink": 0.5,
             "projection_max_backtracks": 6,
+            "residual_oversample_factor": 1.5,
+            "anneal_factor": 0.5,
+            "anneal_min_regularization": 1e-4,
+            "anneal_max_steps": 8,
         }
         res_fine = self._run_optimization(
             res_phase2.x,
