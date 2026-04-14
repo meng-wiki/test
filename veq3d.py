@@ -6,6 +6,7 @@ import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 import time
+from types import SimpleNamespace
 from typing import Callable, Optional, Tuple, Dict, Any
 
 # ---------------------------------------------------------------------------
@@ -153,9 +154,9 @@ class VEQ3D_Solver:
         # =========================================================
         # [自由度扩容] 提升表达能力以包容 3D 边界调制
         # =========================================================
-        self.M_pol = 1 
-        self.N_tor = 1
-        self.L_rad = 3
+        self.M_pol = 2 
+        self.N_tor = 2
+        self.L_rad = 4
         # =========================================================
         
         self.N_fp = 19
@@ -186,6 +187,254 @@ class VEQ3D_Solver:
         self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
         self.fit_boundary()  
         self._initialize_scaling()
+        self._reset_core_freeze_state()
+
+    def _reset_core_freeze_state(self):
+        self.core_fixed_mask = np.zeros(self.num_core_params, dtype=bool)
+        self.core_fixed_values = np.zeros(self.num_core_params, dtype=float)
+
+    def _apply_fixed_core(self, x_core):
+        x = np.asarray(x_core, dtype=float).copy()
+        if np.any(self.core_fixed_mask):
+            x[self.core_fixed_mask] = self.core_fixed_values[self.core_fixed_mask]
+        return x
+
+    def _iter_core_blocks(self):
+        offset = 0
+        block_specs = [
+            ("c0R", self.len_1d),
+            ("c0Z", self.len_1d),
+            ("h", self.len_1d),
+            ("v", self.len_1d),
+            ("k", self.len_1d),
+            ("a", self.len_1d),
+            ("tR", self.len_2d),
+            ("tZ", self.len_2d),
+            ("lam", self.len_lam),
+        ]
+        for name, width in block_specs:
+            size = self.L_rad * width
+            yield name, offset, width
+            offset += size
+
+    def _one_d_mode_map(self):
+        out = {(0, "0"): 0}
+        idx = 1
+        for n in range(1, self.N_tor + 1):
+            out[(n, "c")] = idx
+            out[(n, "s")] = idx + 1
+            idx += 2
+        return out
+
+    def _format_core_mode_label(self, block_name, mode_idx):
+        if block_name in ("c0R", "c0Z", "h", "v", "k", "a"):
+            if mode_idx == 0:
+                return f"{block_name}_0"
+            n = (mode_idx + 1) // 2
+            typ = "c" if (mode_idx % 2 == 1) else "s"
+            return f"{block_name}_{n}{typ}"
+        if block_name in ("tR", "tZ"):
+            m, n, typ = self.modes_2d[mode_idx]
+            return f"{block_name}_{m}_{n}{typ}"
+        if block_name == "lam":
+            m, n = self.lambda_modes[mode_idx]
+            return f"L_{m}_{n}"
+        return f"{block_name}_{mode_idx}"
+
+    def _collect_frozen_parameter_details(self):
+        details = []
+        if not np.any(self.core_fixed_mask):
+            return details
+
+        for block_name, offset, width in self._iter_core_blocks():
+            if width == 0:
+                continue
+            block_mask = self.core_fixed_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            block_vals = self.core_fixed_values[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            for j in range(width):
+                fixed_L = np.flatnonzero(block_mask[:, j]).tolist()
+                if len(fixed_L) == 0:
+                    continue
+                label = self._format_core_mode_label(block_name, j)
+                if len(fixed_L) == self.L_rad and np.all(np.abs(block_vals[:, j]) < 1e-15):
+                    details.append(f"{label:<16} | L=0~{self.L_rad-1} -> 0")
+                else:
+                    l_desc = ", ".join([f"L={L}" for L in fixed_L])
+                    details.append(f"{label:<16} | {l_desc}")
+        return details
+
+    def _print_frozen_parameter_details(self):
+        details = self._collect_frozen_parameter_details()
+        print(">>> 冻结参数明细:")
+        if len(details) == 0:
+            print("    (无冻结参数)")
+            return
+        print("-" * 70)
+        for line in details:
+            print(f"    {line}")
+        print("-" * 70)
+
+    def _build_prefilter_freeze_mask(self, pilot_solver, pilot_x_core, tol=1e-6):
+        full_mask = np.zeros(self.num_core_params, dtype=bool)
+        full_vals = np.zeros(self.num_core_params, dtype=float)
+        pilot_L_check = min(3, pilot_solver.L_rad)
+
+        def should_freeze(pilot_arr, pilot_idx):
+            return bool(np.all(np.abs(pilot_arr[:pilot_L_check, pilot_idx]) < tol))
+
+        (
+            p_c0R,
+            p_c0Z,
+            p_h,
+            p_v,
+            p_k,
+            p_a,
+            p_tR,
+            p_tZ,
+            p_lam,
+        ) = pilot_solver.unpack_core(pilot_x_core)
+        pilot_1d = {
+            "c0R": p_c0R,
+            "c0Z": p_c0Z,
+            "h": p_h,
+            "v": p_v,
+            "k": p_k,
+            "a": p_a,
+        }
+
+        pilot_1d_modes = pilot_solver._one_d_mode_map()
+        full_1d_modes = self._one_d_mode_map()
+        pilot_2d_modes = {mode: i for i, mode in enumerate(pilot_solver.modes_2d)}
+        full_2d_modes = {mode: i for i, mode in enumerate(self.modes_2d)}
+        pilot_lam_modes = {mode: i for i, mode in enumerate(pilot_solver.lambda_modes)}
+        full_lam_modes = {mode: i for i, mode in enumerate(self.lambda_modes)}
+        zero_seed_1d = {k: set() for k in pilot_1d.keys()}  # block -> {(n, typ)}
+        zero_seed_2d = {"tR": [], "tZ": []}                 # block -> [(m, n, typ)]
+        zero_seed_lam = []                                   # [(m, n)]
+
+        # 第一层：对 pilot 与 full 共有的模式做直接判零映射
+        for name, offset, width in self._iter_core_blocks():
+            if width == 0:
+                continue
+            block_mask = full_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            block_vals = full_vals[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+
+            if name in pilot_1d:
+                p_arr = pilot_1d[name]
+                for mode_key, j_full in full_1d_modes.items():
+                    j_pilot = pilot_1d_modes.get(mode_key)
+                    if j_pilot is None:
+                        continue
+                    if should_freeze(p_arr, j_pilot):
+                        block_mask[:, j_full] = True
+                        block_vals[:, j_full] = 0.0
+                        if mode_key == (0, "0"):
+                            zero_seed_1d[name].add((0, "0"))
+                        else:
+                            n_mode, typ_mode = mode_key
+                            zero_seed_1d[name].add((n_mode, typ_mode))
+            elif name in ("tR", "tZ"):
+                p_arr = p_tR if name == "tR" else p_tZ
+                for mode_key, j_full in full_2d_modes.items():
+                    j_pilot = pilot_2d_modes.get(mode_key)
+                    if j_pilot is None:
+                        continue
+                    if should_freeze(p_arr, j_pilot):
+                        block_mask[:, j_full] = True
+                        block_vals[:, j_full] = 0.0
+                        zero_seed_2d[name].append(mode_key)
+            elif name == "lam":
+                for mode_key, j_full in full_lam_modes.items():
+                    j_pilot = pilot_lam_modes.get(mode_key)
+                    if j_pilot is None:
+                        continue
+                    if should_freeze(p_lam, j_pilot):
+                        block_mask[:, j_full] = True
+                        block_vals[:, j_full] = 0.0
+                        zero_seed_lam.append(mode_key)
+
+        # 第二层：m,n 外推冻结（把低阶零种子传播到后续高阶 m,n）
+        # 1D: 同 typ 下，n_seed 为 0 的低阶项若固定，则 n>=n_seed 的同 typ 也固定。
+        for name in pilot_1d.keys():
+            seeds = zero_seed_1d[name]
+            if len(seeds) == 0:
+                continue
+            for block_name, offset, width in self._iter_core_blocks():
+                if block_name != name or width == 0:
+                    continue
+                block_mask = full_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                block_vals = full_vals[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                for mode_key, j_full in full_1d_modes.items():
+                    if mode_key == (0, "0"):
+                        if (0, "0") in seeds:
+                            block_mask[:, j_full] = True
+                            block_vals[:, j_full] = 0.0
+                        continue
+                    n_full, typ_full = mode_key
+                    for n_seed, typ_seed in seeds:
+                        if typ_seed == "0":
+                            continue
+                        if typ_full == typ_seed and n_full >= n_seed:
+                            block_mask[:, j_full] = True
+                            block_vals[:, j_full] = 0.0
+                            break
+
+        # 2D/Lambda 的 n 分支匹配：n=0 仅传播到 n=0；n!=0 按符号分支传播到更高 |n|
+        def n_branch_match(n_full, n_seed):
+            if n_seed == 0:
+                return n_full == 0
+            return (np.sign(n_full) == np.sign(n_seed)) and (abs(n_full) >= abs(n_seed))
+
+        # 2D: 同 typ 且 m>=m_seed 且 n 在同分支并更高阶 -> 固定
+        for name in ("tR", "tZ"):
+            seeds = zero_seed_2d[name]
+            if len(seeds) == 0:
+                continue
+            for block_name, offset, width in self._iter_core_blocks():
+                if block_name != name or width == 0:
+                    continue
+                block_mask = full_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                block_vals = full_vals[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                for (m_full, n_full, typ_full), j_full in full_2d_modes.items():
+                    for m_seed, n_seed, typ_seed in seeds:
+                        if typ_full != typ_seed:
+                            continue
+                        if (m_full >= m_seed) and n_branch_match(n_full, n_seed):
+                            block_mask[:, j_full] = True
+                            block_vals[:, j_full] = 0.0
+                            break
+
+        # Lambda: 与 2D 相同传播规则（无 typ）
+        if len(zero_seed_lam) > 0:
+            for block_name, offset, width in self._iter_core_blocks():
+                if block_name != "lam" or width == 0:
+                    continue
+                block_mask = full_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                block_vals = full_vals[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+                for (m_full, n_full), j_full in full_lam_modes.items():
+                    for m_seed, n_seed in zero_seed_lam:
+                        if (m_full >= m_seed) and n_branch_match(n_full, n_seed):
+                            block_mask[:, j_full] = True
+                            block_vals[:, j_full] = 0.0
+                            break
+
+        # 第三层：径向 L 阶传播（若低 L 被固定为 0，则后续高 L 也固定）
+        for name, offset, width in self._iter_core_blocks():
+            if width == 0:
+                continue
+            block_mask = full_mask[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            block_vals = full_vals[offset:offset + self.L_rad * width].reshape(self.L_rad, width)
+            for j in range(width):
+                fixed_from = None
+                for L in range(self.L_rad):
+                    if block_mask[L, j] and abs(block_vals[L, j]) < 1e-15:
+                        fixed_from = L
+                        break
+                if fixed_from is not None:
+                    block_mask[fixed_from:, j] = True
+                    block_vals[fixed_from:, j] = 0.0
+
+        return full_mask, full_vals
 
     def update_grid(self, Nr, Nt_grid, Nz_grid):
         self.Nr = Nr
@@ -891,20 +1140,31 @@ class VEQ3D_Solver:
         else:
             print(f"    >>> 线性约束投影: 启用 Layer-1 (约束数={self.linear_constraint_A.shape[0]})")
 
+        active_idx = np.flatnonzero(~self.core_fixed_mask)
+        n_active = int(active_idx.size)
+
+        def merge_active_to_full(x_active):
+            x_full = self.core_fixed_values.copy() if np.any(self.core_fixed_mask) else np.zeros(self.num_core_params)
+            x_full[active_idx] = np.asarray(x_active, dtype=float)
+            return x_full
+
         def fun_logged(x_arr):
-            r = np.array(fun_wrapped(jnp.array(x_arr)))
+            x_full = merge_active_to_full(x_arr)
+            r = np.array(fun_wrapped(jnp.array(x_full)))
             eval_hist.append(float(np.linalg.norm(r)))
             return r
 
         def jac_logged(x_arr):
-            return np.array(jac_wrapped(jnp.array(x_arr)))
+            x_full = merge_active_to_full(x_arr)
+            jac_full = np.array(jac_wrapped(jnp.array(x_full)))
+            return jac_full[:, active_idx]
 
         iter_counter = 0
 
         def iter_callback(intermediate_result):
             nonlocal iter_counter
             iter_counter += 1
-            x_iter = np.array(intermediate_result.x, dtype=float)
+            x_iter = merge_active_to_full(np.array(intermediate_result.x, dtype=float))
             en_iter = self.metric_global_energy_terms(x_iter, pressure_scale_factor)
             print(
                 f"    [Iter {iter_counter:03d}] "
@@ -912,20 +1172,25 @@ class VEQ3D_Solver:
                 f"(W_B={en_iter['magnetic_energy']:.6e}, W_p={en_iter['pressure_energy']:.6e})"
             )
         
-        x_curr = self._linear_constraint_project(np.array(x0, dtype=float))
+        x_curr = self._apply_fixed_core(self._linear_constraint_project(np.array(x0, dtype=float)))
         total_nfev = 0
         res = None
 
-        for outer in range(outer_loops):
+        if n_active == 0:
+            print("    >>> 核心参数冻结: 0 个自由变量（全部固定），跳过 least_squares。")
+            res = SimpleNamespace(x=x_curr.copy(), nfev=0, success=True, status=1, message="all variables fixed")
+
+        for outer in range(outer_loops if n_active > 0 else 0):
             budget_left = max_nfev - total_nfev
             if budget_left <= 0:
                 break
             this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
             print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
             try:
+                x_active0 = x_curr[active_idx]
                 res = least_squares(
                     fun_logged,
-                    x_curr,
+                    x_active0,
                     jac=jac_logged if use_exact_jacobian else '2-point',
                     method='trf',
                     xtol=ftol,
@@ -946,7 +1211,7 @@ class VEQ3D_Solver:
                     print("    >>> [JacobianFallback] 检测到 JAX 雅可比内存不足，降级到 SciPy 2-point 数值雅可比继续。")
                     res = least_squares(
                         fun_logged,
-                        x_curr,
+                        x_active0,
                         jac='2-point',
                         method='trf',
                         xtol=ftol,
@@ -957,10 +1222,10 @@ class VEQ3D_Solver:
                     )
                 else:
                     raise
-            x_curr = np.asarray(res.x, dtype=float)
+            x_curr = merge_active_to_full(np.asarray(res.x, dtype=float))
             total_nfev += int(res.nfev)
 
-            x_curr = self._linear_constraint_project(x_curr)
+            x_curr = self._apply_fixed_core(self._linear_constraint_project(x_curr))
 
             if use_prox:
                 x_proj, pinfo = self._apply_proximal_projection(
@@ -968,7 +1233,7 @@ class VEQ3D_Solver:
                     pressure_scale_factor=pressure_scale_factor,
                     projection_cfg=proj_cfg,
                 )
-                x_curr = self._linear_constraint_project(x_proj)
+                x_curr = self._apply_fixed_core(self._linear_constraint_project(x_proj))
                 if pinfo.get("applied", False):
                     print(
                         "    >>> [ProximalProjection] "
@@ -1617,11 +1882,8 @@ class VEQ3D_Solver:
 
         print("=" * 70 + "\n")
 
-    def solve(self):
-        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (奇点相消无障碍版)...")
-        
+    def _run_three_phase_optimization(self, x_guess=None, phase_title_prefix=""):
         def make_even(x): return x + (x % 2)
-        # 预设候选分辨率
         c_Nr_raw = make_even(max(10, 4 * self.L_rad + 2))
         c_Nt_raw = make_even(max(12, 4 * self.M_pol + 4))
         c_Nz_raw = make_even(max(8, 4 * self.N_tor + 2))
@@ -1629,7 +1891,6 @@ class VEQ3D_Solver:
         m_Nt_raw = make_even(c_Nt_raw + 6)
         m_Nz_raw = make_even(c_Nz_raw + 4)
 
-        # 高网格作为上界，强制满足 low <= mid <= high（逐维）
         h_Nr = make_even(max(4, int(self.target_Nr)))
         h_Nt = make_even(max(4, int(self.target_Nt)))
         h_Nz = make_even(max(4, int(self.target_Nz)))
@@ -1643,13 +1904,14 @@ class VEQ3D_Solver:
         c_Nz = min(c_Nz_raw, m_Nz)
 
         phase_total_start_time = time.time()
+        self._all_eval_history = []
+        x0 = np.zeros(self.num_core_params) if x_guess is None else np.asarray(x_guess, dtype=float)
+        x0 = self._apply_fixed_core(x0)
 
         print("\n" + "="*70)
-        print(f">>> [Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
+        print(f">>> {phase_title_prefix}[Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
         print("="*70)
         self.update_grid(c_Nr, c_Nt, c_Nz)
-        x_guess = np.zeros(self.num_core_params)
-        self._all_eval_history = []
         proj_phase1 = {
             "enabled": True,
             "outer_loops": 2,
@@ -1666,9 +1928,8 @@ class VEQ3D_Solver:
             "prox_max_nfev": 6,
             "prox_ftol": 1e-7,
         }
-        
         res_phase1 = self._run_optimization(
-            x_guess,
+            x0,
             max_nfev=200,
             ftol=1e-3,
             pressure_scale_factor=0.0,
@@ -1677,7 +1938,7 @@ class VEQ3D_Solver:
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
-        print(f">>> [Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
+        print(f">>> {phase_title_prefix}[Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
         print("="*70)
         self.update_grid(m_Nr, m_Nt, m_Nz)
         proj_phase2 = {
@@ -1696,7 +1957,6 @@ class VEQ3D_Solver:
             "prox_max_nfev": 8,
             "prox_ftol": 1e-8,
         }
-        
         res_phase2 = self._run_optimization(
             res_phase1.x,
             max_nfev=300,
@@ -1707,7 +1967,7 @@ class VEQ3D_Solver:
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
 
         print("\n" + "="*70)
-        print(f">>> [Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
+        print(f">>> {phase_title_prefix}[Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
         print("="*70)
         self.update_grid(h_Nr, h_Nt, h_Nz)
         proj_phase3 = {
@@ -1726,7 +1986,6 @@ class VEQ3D_Solver:
             "prox_max_nfev": 5,
             "prox_ftol": 1e-6,
         }
-        
         res_fine = self._run_optimization(
             res_phase2.x,
             max_nfev=1600,
@@ -1736,11 +1995,59 @@ class VEQ3D_Solver:
         )
         self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
         phase_total_end_time = time.time()
+        return res_phase1, res_phase2, res_fine, phase_total_end_time - phase_total_start_time
 
+    def _prefilter_from_low_order_case(self, tol=1e-6):
+        print("\n" + "=" * 70)
+        print(">>> 预运行判零: 先执行 (M,N,L)=(1,1,3) 低阶平衡，用于筛除后续完整运行中的零参数")
+        print("=" * 70)
+        pilot = VEQ3D_Solver(boundary_fns=(self._boundary_R_fn, self._boundary_Z_fn))
+        # 强制低阶预运行维度，避免继承当前主求解器的 M/N/L 配置
+        pilot.M_pol = 1
+        pilot.N_tor = 1
+        pilot.L_rad = 3
+        pilot._setup_modes()
+        pilot.p_edge = None
+        pilot.linear_constraint_A = None
+        pilot.linear_constraint_b = None
+        pilot._reset_core_freeze_state()
+
+        pilot.N_fp = self.N_fp
+        pilot.Phi_a = self.Phi_a
+        pilot.mu_0 = self.mu_0
+        pilot.det_chirality = self.det_chirality
+        pilot.regularization_scale = self.regularization_scale
+        pilot.target_Nr = self.target_Nr
+        pilot.target_Nt = self.target_Nt
+        pilot.target_Nz = self.target_Nz
+        print(f">>> 预运行实际维度: (M={pilot.M_pol}, N={pilot.N_tor}, L={pilot.L_rad})")
+        pilot.update_grid(pilot.target_Nr, pilot.target_Nt, pilot.target_Nz)
+        pilot.fit_boundary()
+        pilot._initialize_scaling()
+
+        _, _, pilot_res, pilot_elapsed = pilot._run_three_phase_optimization(phase_title_prefix="[PreFilter] ")
+        freeze_mask, freeze_vals = self._build_prefilter_freeze_mask(pilot, pilot_res.x, tol=tol)
+        self.core_fixed_mask = freeze_mask
+        self.core_fixed_values = freeze_vals
+
+        n_fixed = int(np.sum(self.core_fixed_mask))
+        n_total = int(self.num_core_params)
+        print(f">>> 预运行完成: 耗时 {pilot_elapsed:.2f} s")
+        print(f">>> 判零阈值: |Chebyshev L=0,1,2| < {tol:.1e}")
+        print(f">>> 参数冻结结果: 固定 {n_fixed}/{n_total} 个核心参数，自由参数 {n_total - n_fixed} 个")
+        self._print_frozen_parameter_details()
+        print("=" * 70)
+
+    def solve(self):
+        print(">>> 启动 VEQ-3D 谱精度平衡求解器 (奇点相消无障碍版)...")
+        self._reset_core_freeze_state()
+        self._prefilter_from_low_order_case(tol=1e-6)
+
+        res_phase1, res_phase2, res_fine, elapsed = self._run_three_phase_optimization()
         total_nfev = int(res_phase1.nfev + res_phase2.nfev + res_fine.nfev)
         print("\n" + "=" * 70)
         print(">>> 三阶段收敛总耗时统计:")
-        print(f"    总耗时(Phase 1~3, 至收敛): {phase_total_end_time - phase_total_start_time:.2f} s")
+        print(f"    总耗时(Phase 1~3, 至收敛): {elapsed:.2f} s")
         print(f"    总函数计算次数(nfev):       {total_nfev}")
         print("=" * 70)
 
