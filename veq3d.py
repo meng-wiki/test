@@ -177,6 +177,14 @@ class VEQ3D_Solver:
         self.main_dp_weight = 0.0
         self.main_pressure_edge_weight = 0.0
         self.main_profile_scale_floor = 1.0
+        # 各残差组分总权重（默认 1.0，可在 projection_cfg 中按 phase 覆盖）
+        self.main_phys_weight = 1.0
+        self.force_balance_weight = 1.0
+        self.det_penalty_weight = 1.0
+        self.profile_penalty_weight = 1.0
+        self.reg_tR_weight = 1.0
+        self.reg_tZ_weight = 1.0
+        self.reg_lam_weight = 1.0
         # 线性约束 A x = b（LinearConstraintProjection）；默认无约束
         self.linear_constraint_A = None
         self.linear_constraint_b = None
@@ -937,6 +945,13 @@ class VEQ3D_Solver:
         main_dp_weight = float(self.main_dp_weight)
         main_pressure_edge_weight = float(self.main_pressure_edge_weight)
         main_profile_scale_floor = float(self.main_profile_scale_floor)
+        main_phys_weight = float(self.main_phys_weight)
+        force_balance_weight = float(self.force_balance_weight)
+        det_penalty_weight = float(self.det_penalty_weight)
+        profile_penalty_weight = float(self.profile_penalty_weight)
+        reg_tR_weight = float(self.reg_tR_weight)
+        reg_tZ_weight = float(self.reg_tZ_weight)
+        reg_lam_weight = float(self.reg_lam_weight)
         det_chirality = jnp.array(self.det_chirality)
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
@@ -1102,6 +1117,40 @@ class VEQ3D_Solver:
 
             if apply_scaling:
                 phys_res = phys_res / res_scales
+            phys_res = main_phys_weight * phys_res
+
+            # =================================================================
+            # [新增] 物理量纲力平衡误差：
+            # f_rho = F_rho * ||grad(rho)|| * dV
+            # f_helical = F_helical * ||e_helical|| * dV
+            # =================================================================
+            F_rho_density = sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / mu_0 - dP
+            F_helical_density = sqrt_g * Jr_phys
+            det_metric = (
+                g_rr * (g_tt * g_zz - g_tz**2)
+                - g_rt * (g_rt * g_zz - g_tz * g_rz)
+                + g_rz * (g_rt * g_tz - g_tt * g_rz)
+            )
+            det_metric_safe = jnp.where(
+                jnp.abs(det_metric) < 1e-14,
+                jnp.where(det_metric >= 0.0, 1e-14, -1e-14),
+                det_metric,
+            )
+            g_contra_rr = (g_tt * g_zz - g_tz**2) / det_metric_safe
+            g_contra_tt = (g_rr * g_zz - g_rz**2) / det_metric_safe
+            g_contra_zz = (g_rr * g_tt - g_rt**2) / det_metric_safe
+            g_contra_tz = (g_rt * g_rz - g_rr * g_tz) / det_metric_safe
+            grad_rho_norm = jnp.sqrt(jnp.maximum(g_contra_rr, 1e-24))
+            e_helical_norm = jnp.sqrt(
+                jnp.maximum(
+                    (Bt_sup**2) * g_contra_zz + (Bz_sup**2) * g_contra_tt - 2.0 * Bt_sup * Bz_sup * g_contra_tz,
+                    1e-24,
+                )
+            )
+            vol_w_fb = jnp.abs(sqrt_g) * weights_3d * (dtheta * dzeta)
+            fb_rho_res = F_rho_density * grad_rho_norm * vol_w_fb
+            fb_helical_res = F_helical_density * e_helical_norm * vol_w_fb
+            force_balance_res = force_balance_weight * jnp.concatenate([fb_rho_res.flatten(), fb_helical_res.flatten()])
 
             # 将 dP 剖面约束直接并入主残差，避免“主优化-投影”循环互相抵消
             profile_res_list = []
@@ -1126,18 +1175,18 @@ class VEQ3D_Solver:
             # [物理闭环终极修复 2]：仅对严重交叠进行惩罚，放行磁轴自然演化
             # =================================================================
             # 基于手性修正后的 det_eff 施加约束，要求 det_eff >= eps
-            penalty_res = jnp.where(det_eff < 1e-6, 1e3 * (1e-6 - det_eff), 0.0).flatten()
+            penalty_res = det_penalty_weight * jnp.where(det_eff < 1e-6, 1e3 * (1e-6 - det_eff), 0.0).flatten()
                 
-            final_res_list = [phys_res, penalty_res]
+            final_res_list = [phys_res, force_balance_res, penalty_res]
             if len(profile_res_list) > 0:
-                final_res_list.append(jnp.concatenate(profile_res_list))
+                final_res_list.append(profile_penalty_weight * jnp.concatenate(profile_res_list))
             
             if len_2d > 0:
-                final_res_list.append((c_tR * reg_weight_2d[None, :] * reg_active_tR * regularization_scale).flatten())
-                final_res_list.append((c_tZ * reg_weight_2d[None, :] * reg_active_tZ * regularization_scale).flatten())
+                final_res_list.append((reg_tR_weight * c_tR * reg_weight_2d[None, :] * reg_active_tR * regularization_scale).flatten())
+                final_res_list.append((reg_tZ_weight * c_tZ * reg_weight_2d[None, :] * reg_active_tZ * regularization_scale).flatten())
                 
             if len_lam > 0:
-                final_res_list.append((c_lam * reg_active_lam * regularization_scale).flatten())
+                final_res_list.append((reg_lam_weight * c_lam * reg_active_lam * regularization_scale).flatten())
                 
             return jnp.concatenate(final_res_list)
             
@@ -1152,6 +1201,13 @@ class VEQ3D_Solver:
         self.main_dp_weight = float(proj_cfg.get("main_dp_weight", 0.0))
         self.main_pressure_edge_weight = float(proj_cfg.get("main_pressure_edge_weight", 0.0))
         self.main_profile_scale_floor = float(proj_cfg.get("main_profile_scale_floor", 1.0))
+        self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 1.0))
+        self.force_balance_weight = float(proj_cfg.get("force_balance_weight", 1.0))
+        self.det_penalty_weight = float(proj_cfg.get("det_penalty_weight", 1.0))
+        self.profile_penalty_weight = float(proj_cfg.get("profile_penalty_weight", 1.0))
+        self.reg_tR_weight = float(proj_cfg.get("reg_tR_weight", 1.0))
+        self.reg_tZ_weight = float(proj_cfg.get("reg_tZ_weight", 1.0))
+        self.reg_lam_weight = float(proj_cfg.get("reg_lam_weight", 1.0))
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         use_prox = bool(proj_cfg.get("enabled", False))
         outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
@@ -1209,6 +1265,16 @@ class VEQ3D_Solver:
                 f"W_mhd={en_iter['total_energy']:.6e} "
                 f"(W_B={en_iter['magnetic_energy']:.6e}, W_p={en_iter['pressure_energy']:.6e})"
             )
+            rb_iter = self.metric_residual_group_breakdown(x_iter, pressure_scale_factor)
+            print("    当前残差组分统计 (L2 范数):")
+            for item in rb_iter["groups"]:
+                print(
+                    f"      - {item['name_cn']:<18}: "
+                    f"原始={item['norm_unscaled']:.6e}, "
+                    f"缩放后={item['norm_scaled']:.6e}, "
+                    f"缩放因子={item['effective_scale']:.6e}, "
+                    f"维度={item['size']}"
+                )
         
         x_curr = self._apply_fixed_core(self._linear_constraint_project(np.array(x0, dtype=float)))
         total_nfev = 0
@@ -1667,7 +1733,7 @@ class VEQ3D_Solver:
         }
 
     def metric_penalty_breakdown(self, x_core, pressure_scale_factor=1.0):
-        """将惩罚项拆分为 det/profile/reg_tR/reg_tZ/reg_lam 五类（禁用 scaling）。"""
+        """将惩罚项拆分为 force_balance/det/profile/reg_tR/reg_tZ/reg_lam 六类（禁用 scaling）。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         x_eff = self._apply_fixed_core(x_core)
         res_all = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
@@ -1675,6 +1741,7 @@ class VEQ3D_Solver:
         res_phys = res_all[:phys_len]
         res_pen_all = res_all[phys_len:]
 
+        fb_len = 2 * self.Nr * self.Nt_grid * self.Nz_grid
         det_len = self.Nr * self.Nt_grid * self.Nz_grid
         profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
         reg_tR_len = self.L_rad * self.len_2d
@@ -1682,6 +1749,8 @@ class VEQ3D_Solver:
         reg_lam_len = self.L_rad * self.len_lam
 
         idx = 0
+        res_fb = res_pen_all[idx:idx + fb_len]
+        idx += fb_len
         res_det = res_pen_all[idx:idx + det_len]
         idx += det_len
         res_profile = res_pen_all[idx:idx + profile_len]
@@ -1692,13 +1761,14 @@ class VEQ3D_Solver:
         idx += reg_tZ_len
         res_reg_lam = res_pen_all[idx:idx + reg_lam_len]
 
-        res_pen = np.concatenate([res_det, res_profile, res_reg_tR, res_reg_tZ, res_reg_lam]) if (
-            (res_det.size + res_profile.size + res_reg_tR.size + res_reg_tZ.size + res_reg_lam.size) > 0
+        res_pen = np.concatenate([res_fb, res_det, res_profile, res_reg_tR, res_reg_tZ, res_reg_lam]) if (
+            (res_fb.size + res_det.size + res_profile.size + res_reg_tR.size + res_reg_tZ.size + res_reg_lam.size) > 0
         ) else np.array([], dtype=float)
         norm_phys = float(np.linalg.norm(res_phys))
         norm_pen = float(np.linalg.norm(res_pen))
         return {
             "norm_phys_unscaled": norm_phys,
+            "norm_force_balance_unscaled": float(np.linalg.norm(res_fb)),
             "norm_det_penalty_unscaled": float(np.linalg.norm(res_det)),
             "norm_profile_penalty_unscaled": float(np.linalg.norm(res_profile)),
             "norm_reg_tR_unscaled": float(np.linalg.norm(res_reg_tR)),
@@ -1732,6 +1802,69 @@ class VEQ3D_Solver:
             "fb_before": float(fb_before),
             "fb_after": float(fb_after),
             "disruption_ratio": float(fb_after / (fb_before + 1e-14)),
+        }
+
+    def metric_residual_group_breakdown(self, x_core, pressure_scale_factor=1.0):
+        """按组分拆分残差，返回原始值与乘缩放因子后的值。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        x_eff = self._apply_fixed_core(x_core)
+        res_scaled = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=True), dtype=float)
+        res_unscaled = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
+
+        phys_len = self.num_core_params
+        fb_len = 2 * self.Nr * self.Nt_grid * self.Nz_grid
+        det_len = self.Nr * self.Nt_grid * self.Nz_grid
+        profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
+        reg_tR_len = self.L_rad * self.len_2d
+        reg_tZ_len = self.L_rad * self.len_2d
+        reg_lam_len = self.L_rad * self.len_lam
+
+        groups_meta = [
+            ("main_phys", "主物理残差", phys_len),
+            ("force_balance", "力平衡误差", fb_len),
+            ("det_penalty", "雅可比惩罚(det)", det_len),
+            ("profile_penalty", "剖面约束惩罚", profile_len),
+            ("reg_tR", "正则项 tR", reg_tR_len),
+            ("reg_tZ", "正则项 tZ", reg_tZ_len),
+            ("reg_lam", "正则项 Lambda", reg_lam_len),
+        ]
+
+        idx = 0
+        groups = []
+        for key, name_cn, glen in groups_meta:
+            glen = int(max(0, glen))
+            g_unscaled = res_unscaled[idx:idx + glen]
+            g_scaled = res_scaled[idx:idx + glen]
+            idx += glen
+            norm_unscaled = float(np.linalg.norm(g_unscaled))
+            norm_scaled = float(np.linalg.norm(g_scaled))
+            groups.append({
+                "key": key,
+                "name_cn": name_cn,
+                "size": glen,
+                "norm_unscaled": norm_unscaled,
+                "norm_scaled": norm_scaled,
+                "effective_scale": float(norm_scaled / (norm_unscaled + 1e-14)),
+            })
+
+        if idx < res_unscaled.size:
+            tail_unscaled = res_unscaled[idx:]
+            tail_scaled = res_scaled[idx:]
+            norm_unscaled = float(np.linalg.norm(tail_unscaled))
+            norm_scaled = float(np.linalg.norm(tail_scaled))
+            groups.append({
+                "key": "tail_unknown",
+                "name_cn": "未分类尾部",
+                "size": int(res_unscaled.size - idx),
+                "norm_unscaled": norm_unscaled,
+                "norm_scaled": norm_scaled,
+                "effective_scale": float(norm_scaled / (norm_unscaled + 1e-14)),
+            })
+
+        return {
+            "groups": groups,
+            "norm_total_unscaled": float(np.linalg.norm(res_unscaled)),
+            "norm_total_scaled": float(np.linalg.norm(res_scaled)),
         }
 
     def metric_directional_spectral_blocking(self, x_core):
@@ -1864,6 +1997,7 @@ class VEQ3D_Solver:
             f"    - physics_to_penalty_ratio        : {ppr['penalty_ratio']:.6e} "
             f"[{ppr_flag}: 推荐 < 1e-1]"
         )
+        print(f"    - force_balance_penalty           : {pbd['norm_force_balance_unscaled']:.6e}")
         print(f"    - det_penalty                     : {pbd['norm_det_penalty_unscaled']:.6e}")
         print(f"    - profile_penalty                 : {pbd['norm_profile_penalty_unscaled']:.6e}")
         print(f"    - reg_tR                          : {pbd['norm_reg_tR_unscaled']:.6e}")
@@ -2006,6 +2140,7 @@ class VEQ3D_Solver:
             "p_profile_strength": 0.0,
             "main_dp_weight": 0.0,
             "main_pressure_edge_weight": 0.0,
+            "force_balance_weight": 1.0,
             "prox_max_nfev": 6,
             "prox_ftol": 1e-7,
         }
@@ -2035,6 +2170,7 @@ class VEQ3D_Solver:
             "p_profile_strength": 0.0,
             "main_dp_weight": 0.15,
             "main_pressure_edge_weight": 0.05,
+            "force_balance_weight": 1.0,
             "prox_max_nfev": 8,
             "prox_ftol": 1e-8,
         }
@@ -2064,6 +2200,13 @@ class VEQ3D_Solver:
             "p_profile_strength": 0.0,
             "main_dp_weight": 0.5,
             "main_pressure_edge_weight": 0.2,
+            "main_phys_weight": 1.0,
+            "force_balance_weight": 1.0,
+            "det_penalty_weight": 0,
+            "profile_penalty_weight": 0.1,
+            "reg_tR_weight": 0.1,
+            "reg_tZ_weight": 0.1,
+            "reg_lam_weight": 0.1,
             "prox_max_nfev": 5,
             "prox_ftol": 1e-6,
         }
