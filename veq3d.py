@@ -154,9 +154,9 @@ class VEQ3D_Solver:
         # =========================================================
         # [自由度扩容] 提升表达能力以包容 3D 边界调制
         # =========================================================
-        self.M_pol = 2 
-        self.N_tor = 2
-        self.L_rad = 4
+        self.M_pol = 1 
+        self.N_tor = 1
+        self.L_rad = 3
         # =========================================================
         
         self.N_fp = 19
@@ -273,6 +273,26 @@ class VEQ3D_Solver:
         for line in details:
             print(f"    {line}")
         print("-" * 70)
+
+    def _regularization_active_stats(self):
+        stats = {"tR_active": 0, "tR_total": 0, "tZ_active": 0, "tZ_total": 0, "lam_active": 0, "lam_total": 0}
+        if self.num_core_params <= 0:
+            return stats
+        offset = 0
+        for name, width in [("c0R", self.len_1d), ("c0Z", self.len_1d), ("h", self.len_1d), ("v", self.len_1d), ("k", self.len_1d), ("a", self.len_1d), ("tR", self.len_2d), ("tZ", self.len_2d), ("lam", self.len_lam)]:
+            size = self.L_rad * width
+            if name in ("tR", "tZ", "lam") and size > 0:
+                m = self.core_fixed_mask[offset:offset + size]
+                active = int(np.sum(~m))
+                total = int(size)
+                if name == "tR":
+                    stats["tR_active"], stats["tR_total"] = active, total
+                elif name == "tZ":
+                    stats["tZ_active"], stats["tZ_total"] = active, total
+                else:
+                    stats["lam_active"], stats["lam_total"] = active, total
+            offset += size
+        return stats
 
     def _build_prefilter_freeze_mask(self, pilot_solver, pilot_x_core, tol=1e-6):
         full_mask = np.zeros(self.num_core_params, dtype=bool)
@@ -921,6 +941,22 @@ class VEQ3D_Solver:
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
         N_fp, mu_0, dtheta, dzeta = self.N_fp, self.mu_0, self.dtheta, self.dzeta
+        core_fixed_mask_np = np.asarray(self.core_fixed_mask, dtype=bool)
+        if core_fixed_mask_np.size != self.num_core_params:
+            core_fixed_mask_np = np.zeros(self.num_core_params, dtype=bool)
+        off_tR = (6 * len_1d) * L_rad
+        off_tZ = off_tR + len_2d * L_rad
+        off_lam = off_tZ + len_2d * L_rad
+        if len_2d > 0:
+            reg_active_tR = jnp.array((~core_fixed_mask_np[off_tR:off_tR + len_2d * L_rad]).reshape((L_rad, len_2d)).astype(float))
+            reg_active_tZ = jnp.array((~core_fixed_mask_np[off_tZ:off_tZ + len_2d * L_rad]).reshape((L_rad, len_2d)).astype(float))
+        else:
+            reg_active_tR = jnp.zeros((L_rad, 0))
+            reg_active_tZ = jnp.zeros((L_rad, 0))
+        if len_lam > 0:
+            reg_active_lam = jnp.array((~core_fixed_mask_np[off_lam:off_lam + len_lam * L_rad]).reshape((L_rad, len_lam)).astype(float))
+        else:
+            reg_active_lam = jnp.zeros((L_rad, 0))
             
         def jax_unpack_edge(p):
             idx = 2
@@ -1097,11 +1133,11 @@ class VEQ3D_Solver:
                 final_res_list.append(jnp.concatenate(profile_res_list))
             
             if len_2d > 0:
-                final_res_list.append((c_tR * reg_weight_2d[None, :] * regularization_scale).flatten())
-                final_res_list.append((c_tZ * reg_weight_2d[None, :] * regularization_scale).flatten())
+                final_res_list.append((c_tR * reg_weight_2d[None, :] * reg_active_tR * regularization_scale).flatten())
+                final_res_list.append((c_tZ * reg_weight_2d[None, :] * reg_active_tZ * regularization_scale).flatten())
                 
             if len_lam > 0:
-                final_res_list.append((c_lam * regularization_scale).flatten())
+                final_res_list.append((c_lam * reg_active_lam * regularization_scale).flatten())
                 
             return jnp.concatenate(final_res_list)
             
@@ -1618,18 +1654,55 @@ class VEQ3D_Solver:
 
     def metric_penalty_ratio(self, x_core, pressure_scale_factor=1.0):
         """物理残差与惩罚/正则残差比例（禁用 scaling）。"""
-        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
-        res_all = np.array(jax_res_fn(jnp.array(x_core), apply_scaling=False), dtype=float)
-        phys_len = self.num_core_params
-        res_phys = res_all[:phys_len]
-        res_pen = res_all[phys_len:]
-        norm_phys = float(np.linalg.norm(res_phys))
-        norm_pen = float(np.linalg.norm(res_pen))
+        breakdown = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
+        norm_phys = breakdown["norm_phys_unscaled"]
+        norm_pen = breakdown["norm_penalty_unscaled"]
         ratio = norm_pen / (norm_phys + 1e-14)
         return {
             "norm_phys_unscaled": norm_phys,
             "norm_penalty_unscaled": norm_pen,
             "penalty_ratio": ratio,
+        }
+
+    def metric_penalty_breakdown(self, x_core, pressure_scale_factor=1.0):
+        """将惩罚项拆分为 det/profile/reg_tR/reg_tZ/reg_lam 五类（禁用 scaling）。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        x_eff = self._apply_fixed_core(x_core)
+        res_all = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
+        phys_len = self.num_core_params
+        res_phys = res_all[:phys_len]
+        res_pen_all = res_all[phys_len:]
+
+        det_len = self.Nr * self.Nt_grid * self.Nz_grid
+        profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
+        reg_tR_len = self.L_rad * self.len_2d
+        reg_tZ_len = self.L_rad * self.len_2d
+        reg_lam_len = self.L_rad * self.len_lam
+
+        idx = 0
+        res_det = res_pen_all[idx:idx + det_len]
+        idx += det_len
+        res_profile = res_pen_all[idx:idx + profile_len]
+        idx += profile_len
+        res_reg_tR = res_pen_all[idx:idx + reg_tR_len]
+        idx += reg_tR_len
+        res_reg_tZ = res_pen_all[idx:idx + reg_tZ_len]
+        idx += reg_tZ_len
+        res_reg_lam = res_pen_all[idx:idx + reg_lam_len]
+
+        res_pen = np.concatenate([res_det, res_profile, res_reg_tR, res_reg_tZ, res_reg_lam]) if (
+            (res_det.size + res_profile.size + res_reg_tR.size + res_reg_tZ.size + res_reg_lam.size) > 0
+        ) else np.array([], dtype=float)
+        norm_phys = float(np.linalg.norm(res_phys))
+        norm_pen = float(np.linalg.norm(res_pen))
+        return {
+            "norm_phys_unscaled": norm_phys,
+            "norm_det_penalty_unscaled": float(np.linalg.norm(res_det)),
+            "norm_profile_penalty_unscaled": float(np.linalg.norm(res_profile)),
+            "norm_reg_tR_unscaled": float(np.linalg.norm(res_reg_tR)),
+            "norm_reg_tZ_unscaled": float(np.linalg.norm(res_reg_tZ)),
+            "norm_reg_lam_unscaled": float(np.linalg.norm(res_reg_lam)),
+            "norm_penalty_unscaled": norm_pen,
         }
 
     def metric_scaling_masking(self, x_core, pressure_scale_factor=1.0):
@@ -1739,6 +1812,7 @@ class VEQ3D_Solver:
         hist = self.metric_residual_drop_history()
         cond = self.metric_conditioning_proxy(x_core, pressure_scale_factor)
         ppr = self.metric_penalty_ratio(x_core, pressure_scale_factor)
+        pbd = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
         smf = self.metric_scaling_masking(x_core, pressure_scale_factor)
         proj_cfg = projection_cfg if projection_cfg is not None else getattr(self, "_last_projection_cfg", None)
         pdi = self.metric_projection_disruption(x_core, proj_cfg, pressure_scale_factor)
@@ -1788,6 +1862,11 @@ class VEQ3D_Solver:
             f"    - physics_to_penalty_ratio        : {ppr['penalty_ratio']:.6e} "
             f"[{ppr_flag}: 推荐 < 1e-1]"
         )
+        print(f"    - det_penalty                     : {pbd['norm_det_penalty_unscaled']:.6e}")
+        print(f"    - profile_penalty                 : {pbd['norm_profile_penalty_unscaled']:.6e}")
+        print(f"    - reg_tR                          : {pbd['norm_reg_tR_unscaled']:.6e}")
+        print(f"    - reg_tZ                          : {pbd['norm_reg_tZ_unscaled']:.6e}")
+        print(f"    - reg_lam                         : {pbd['norm_reg_lam_unscaled']:.6e}")
         print(
             f"    - scaling_masking_factor          : {smf['masking_factor']:.6e} "
             f"[{smf_flag}: 推荐 < 1e2]"
@@ -2035,6 +2114,13 @@ class VEQ3D_Solver:
         print(f">>> 预运行完成: 耗时 {pilot_elapsed:.2f} s")
         print(f">>> 判零阈值: |Chebyshev L=0,1,2| < {tol:.1e}")
         print(f">>> 参数冻结结果: 固定 {n_fixed}/{n_total} 个核心参数，自由参数 {n_total - n_fixed} 个")
+        reg_stats = self._regularization_active_stats()
+        print(
+            ">>> 正则有效自由度: "
+            f"tR {reg_stats['tR_active']}/{reg_stats['tR_total']}, "
+            f"tZ {reg_stats['tZ_active']}/{reg_stats['tZ_total']}, "
+            f"Lambda {reg_stats['lam_active']}/{reg_stats['lam_total']}"
+        )
         self._print_frozen_parameter_details()
         print("=" * 70)
 
