@@ -163,15 +163,15 @@ class VEQ3D_Solver:
         self.Phi_a = 1.0
         self.mu_0 = 4 * np.pi * 1e-7
         
-        self.target_Nr = 16
-        self.target_Nt = 16
+        self.target_Nr = 24
+        self.target_Nt = 24
         self.target_Nz = 16
         
         self.p_edge = None  
         # det 手性方向（+1/-1）：用于兼容输入 LCFS 与 RZ 参数化方向差异
         self.det_chirality = 1.0
         # 正则项总开关缩放，避免其在物理残差前喧宾夺主
-        self.regularization_scale = 1e-3
+        self.regularization_scale = 0.5
         # 主残差中的剖面约束权重（默认关闭，仅在 _run_optimization 中按 phase 注入）
         self.main_dp_weight = 0.0
         self.main_pressure_edge_weight = 0.0
@@ -248,7 +248,7 @@ class VEQ3D_Solver:
         if self.len_2d > 0:
             m_vals_2d = np.array([m for m, n, typ in self.modes_2d])
             n_vals_2d = np.array([n for m, n, typ in self.modes_2d])
-            self.reg_weight_2d = np.sqrt(1e-6 * (m_vals_2d**2 + n_vals_2d**2))
+            self.reg_weight_2d = np.sqrt(m_vals_2d**2 + n_vals_2d**2)
         else:
             self.reg_weight_2d = np.array([])
 
@@ -852,7 +852,7 @@ class VEQ3D_Solver:
                 final_res_list.append((c_tZ * reg_weight_2d[None, :] * regularization_scale).flatten())
                 
             if len_lam > 0:
-                final_res_list.append((c_lam * jnp.sqrt(1e-6) * regularization_scale).flatten())
+                final_res_list.append((c_lam * regularization_scale).flatten())
                 
             return jnp.concatenate(final_res_list)
             
@@ -871,6 +871,7 @@ class VEQ3D_Solver:
         use_prox = bool(proj_cfg.get("enabled", False))
         outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
+        use_exact_jacobian = bool(proj_cfg.get("use_exact_jacobian", True))
         
         @jax.jit
         def fun_wrapped(x_arr):
@@ -882,6 +883,7 @@ class VEQ3D_Solver:
 
         start_time = time.time()
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
+        print(f"    >>> 雅可比模式: {'JAX 精确雅可比' if use_exact_jacobian else 'SciPy 2-point 数值雅可比'}")
         eval_hist = []
         self._last_eval_history = eval_hist
         if self.linear_constraint_A is None:
@@ -920,17 +922,41 @@ class VEQ3D_Solver:
                 break
             this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
             print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
-            res = least_squares(
-                fun_logged,
-                x_curr,
-                jac=jac_logged,
-                method='trf',
-                xtol=ftol,
-                ftol=ftol,
-                max_nfev=this_chunk,
-                verbose=2,
-                callback=iter_callback
-            )
+            try:
+                res = least_squares(
+                    fun_logged,
+                    x_curr,
+                    jac=jac_logged if use_exact_jacobian else '2-point',
+                    method='trf',
+                    xtol=ftol,
+                    ftol=ftol,
+                    max_nfev=this_chunk,
+                    verbose=2,
+                    callback=iter_callback
+                )
+            except Exception as exc:
+                err_msg = str(exc)
+                oom_like = (
+                    "RESOURCE_EXHAUSTED" in err_msg
+                    or "Out of memory" in err_msg
+                    or "out of memory" in err_msg
+                )
+                if use_exact_jacobian and oom_like:
+                    use_exact_jacobian = False
+                    print("    >>> [JacobianFallback] 检测到 JAX 雅可比内存不足，降级到 SciPy 2-point 数值雅可比继续。")
+                    res = least_squares(
+                        fun_logged,
+                        x_curr,
+                        jac='2-point',
+                        method='trf',
+                        xtol=ftol,
+                        ftol=ftol,
+                        max_nfev=this_chunk,
+                        verbose=2,
+                        callback=iter_callback
+                    )
+                else:
+                    raise
             x_curr = np.asarray(res.x, dtype=float)
             total_nfev += int(res.nfev)
 
@@ -1686,24 +1712,24 @@ class VEQ3D_Solver:
         self.update_grid(h_Nr, h_Nt, h_Nz)
         proj_phase3 = {
             "enabled": True,
-            "outer_loops": 4,
-            "lsq_chunk_nfev": 180,
-            "strength": 0.16,
-            "boundary_strength": 0.24,
-            "anchor_weight": 2e-3,
-            "dp_strength": 1.0,
-            "pressure_edge_strength": 0.8,
+            "outer_loops": 2,
+            "lsq_chunk_nfev": 800,
+            "strength": 0.05,
+            "boundary_strength": 0.1,
+            "anchor_weight": 5e-2,
+            "dp_strength": 0.1,
+            "pressure_edge_strength": 0.1,
             "pressure_axis_strength": 0.0,
             "p_profile_strength": 0.0,
-            "main_dp_weight": 0.45,
-            "main_pressure_edge_weight": 0.15,
-            "prox_max_nfev": 12,
-            "prox_ftol": 1e-9,
+            "main_dp_weight": 0.5,
+            "main_pressure_edge_weight": 0.2,
+            "prox_max_nfev": 5,
+            "prox_ftol": 1e-6,
         }
         
         res_fine = self._run_optimization(
             res_phase2.x,
-            max_nfev=800,
+            max_nfev=1600,
             ftol=1e-12,
             pressure_scale_factor=1.0,
             projection_cfg=proj_phase3,
