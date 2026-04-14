@@ -170,6 +170,12 @@ class VEQ3D_Solver:
         self.p_edge = None  
         # det 手性方向（+1/-1）：用于兼容输入 LCFS 与 RZ 参数化方向差异
         self.det_chirality = 1.0
+        # 正则项总开关缩放，避免其在物理残差前喧宾夺主
+        self.regularization_scale = 1e-3
+        # 主残差中的剖面约束权重（默认关闭，仅在 _run_optimization 中按 phase 注入）
+        self.main_dp_weight = 0.0
+        self.main_pressure_edge_weight = 0.0
+        self.main_profile_scale_floor = 1.0
         # 线性约束 A x = b（LinearConstraintProjection）；默认无约束
         self.linear_constraint_A = None
         self.linear_constraint_b = None
@@ -353,9 +359,8 @@ class VEQ3D_Solver:
     def _initialize_scaling(self):
         print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
         print(f">>> 总核心参数量: {self.num_core_params} 个")
+        # 不再使用超大数值缩放，避免梯度容差误判导致提前停止
         self.res_scales = np.ones(self.num_core_params)
-        self.res_scales[:self.num_geom_params] = 1e5
-        self.res_scales[self.num_geom_params:] = 1e6
 
     def compute_psi(self, rho):
         """极向磁通 ψ(ρ)，与 _get_profiles 中 psip=dψ/dρ 保持一致。"""
@@ -469,6 +474,13 @@ class VEQ3D_Solver:
         strength = float(cfg.get("strength", 0.1))
         boundary_strength = float(cfg.get("boundary_strength", 0.2))
         anchor_weight = float(cfg.get("anchor_weight", 1e-3))
+        use_flux_integral_constraints = bool(cfg.get("use_flux_integral_constraints", False))
+        flux_strength = float(cfg.get("flux_strength", strength))
+        dp_strength = float(cfg.get("dp_strength", strength))
+        p_profile_strength = float(cfg.get("p_profile_strength", 0.0))
+        pressure_edge_strength = float(cfg.get("pressure_edge_strength", boundary_strength))
+        pressure_axis_strength = float(cfg.get("pressure_axis_strength", 0.0))
+        profile_scale_floor = float(cfg.get("profile_scale_floor", 1.0))
         prox_max_nfev = int(cfg.get("prox_max_nfev", 10))
         prox_ftol = float(cfg.get("prox_ftol", 1e-8))
 
@@ -478,20 +490,27 @@ class VEQ3D_Solver:
             d = self._profile_projection_data(x_trial, pressure_scale_factor)
             out = []
 
-            s_p = np.sqrt(np.mean(d["Phip_tar"] ** 2)) + 1e-14
-            s_s = np.sqrt(np.mean(d["psip_tar"] ** 2)) + 1e-14
-            s_d = np.sqrt(np.mean(d["dP_tar"] ** 2)) + 1e-14
+            s_p = max(np.sqrt(np.mean(d["Phip_tar"] ** 2)), profile_scale_floor) + 1e-14
+            s_s = max(np.sqrt(np.mean(d["psip_tar"] ** 2)), profile_scale_floor) + 1e-14
+            s_d = max(np.sqrt(np.mean(d["dP_tar"] ** 2)), profile_scale_floor) + 1e-14
+            s_P = max(np.sqrt(np.mean(d["P_tar"] ** 2)), profile_scale_floor) + 1e-14
 
-            out.extend((strength * (d["Phip_est"] - d["Phip_tar"]) / s_p).tolist())
-            out.extend((strength * (d["psip_est"] - d["psip_tar"]) / s_s).tolist())
-            out.extend((strength * (d["dP_est"] - d["dP_tar"]) / s_d).tolist())
+            out.extend((flux_strength * (d["Phip_est"] - d["Phip_tar"]) / s_p).tolist())
+            out.extend((flux_strength * (d["psip_est"] - d["psip_tar"]) / s_s).tolist())
+            out.extend((dp_strength * (d["dP_est"] - d["dP_tar"]) / s_d).tolist())
 
-            out.extend((strength * (d["phi_est"] - d["phi_tar"]) / (abs(self.Phi_a) + 1e-14)).tolist())
-            out.extend((strength * (d["psi_est"] - d["psi_tar"]) / (abs(d["psi_tar"][-1]) + 1e-14)).tolist())
-
-            out.append(boundary_strength * (d["phi_est"][-1] - self.Phi_a) / (abs(self.Phi_a) + 1e-14))
-            out.append(boundary_strength * d["psi_est"][0])
-            out.append(boundary_strength * d["P_est"][-1] / (np.sqrt(np.mean(d["P_tar"] ** 2)) + 1e-14))
+            # 可选：积分型通量约束（默认关闭，避免离散积分误差反向污染 proximal）
+            if use_flux_integral_constraints:
+                out.extend((strength * (d["phi_est"] - d["phi_tar"]) / (abs(self.Phi_a) + 1e-14)).tolist())
+                out.extend((strength * (d["psi_est"] - d["psi_tar"]) / (abs(d["psi_tar"][-1]) + 1e-14)).tolist())
+                out.append(boundary_strength * (d["phi_est"][-1] - self.Phi_a) / (abs(self.Phi_a) + 1e-14))
+                out.append(boundary_strength * d["psi_est"][0])
+            # 推荐策略：强约束 dP + 边界锚点 P(1)=0；P 全剖面仅可选弱约束
+            out.append(pressure_edge_strength * d["P_est"][-1] / s_P)
+            if pressure_axis_strength > 0:
+                out.append(pressure_axis_strength * (d["P_est"][0] - d["P_tar"][0]) / s_P)
+            if p_profile_strength > 0:
+                out.extend((p_profile_strength * (d["P_est"] - d["P_tar"]) / s_P).tolist())
 
             if anchor_weight > 0:
                 x_scale = np.maximum(np.abs(x_ref), 1.0)
@@ -645,6 +664,10 @@ class VEQ3D_Solver:
         
         k_th, k_ze, weights_3d = jnp.array(self.k_th), jnp.array(self.k_ze), jnp.array(self.weights_3d)
         res_scales, p_edge = jnp.array(self.res_scales), jnp.array(self.p_edge)
+        regularization_scale = float(self.regularization_scale)
+        main_dp_weight = float(self.main_dp_weight)
+        main_pressure_edge_weight = float(self.main_pressure_edge_weight)
+        main_profile_scale_floor = float(self.main_profile_scale_floor)
         det_chirality = jnp.array(self.det_chirality)
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
@@ -794,6 +817,25 @@ class VEQ3D_Solver:
 
             if apply_scaling:
                 phys_res = phys_res / res_scales
+
+            # 将 dP 剖面约束直接并入主残差，避免“主优化-投影”循环互相抵消
+            profile_res_list = []
+            if (main_dp_weight > 0.0) or (main_pressure_edge_weight > 0.0):
+                dP_recon_3d = sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / mu_0
+                dP_recon_surf = jnp.mean(dP_recon_3d, axis=(1, 2))
+                dP_tar_surf = jnp.mean(dP, axis=(1, 2))
+                s_d = jnp.maximum(jnp.sqrt(jnp.mean(dP_tar_surf**2)), main_profile_scale_floor) + 1e-14
+
+                if main_dp_weight > 0.0:
+                    profile_res_list.append(main_dp_weight * (dP_recon_surf - dP_tar_surf) / s_d)
+
+                if main_pressure_edge_weight > 0.0:
+                    P_tar_surf = jnp.mean(P, axis=(1, 2))
+                    dr = rho_1d[1:] - rho_1d[:-1]
+                    dP_mid = 0.5 * (dP_recon_surf[1:] + dP_recon_surf[:-1])
+                    P_edge_est = P_tar_surf[0] + jnp.sum(dP_mid * dr)
+                    s_P = jnp.maximum(jnp.sqrt(jnp.mean(P_tar_surf**2)), main_profile_scale_floor) + 1e-14
+                    profile_res_list.append(jnp.array([main_pressure_edge_weight * (P_edge_est / s_P)]))
                 
             # =================================================================
             # [物理闭环终极修复 2]：仅对严重交叠进行惩罚，放行磁轴自然演化
@@ -802,13 +844,15 @@ class VEQ3D_Solver:
             penalty_res = jnp.where(det_eff < 1e-6, 1e3 * (1e-6 - det_eff), 0.0).flatten()
                 
             final_res_list = [phys_res, penalty_res]
+            if len(profile_res_list) > 0:
+                final_res_list.append(jnp.concatenate(profile_res_list))
             
             if len_2d > 0:
-                final_res_list.append((c_tR * reg_weight_2d[None, :]).flatten())
-                final_res_list.append((c_tZ * reg_weight_2d[None, :]).flatten())
+                final_res_list.append((c_tR * reg_weight_2d[None, :] * regularization_scale).flatten())
+                final_res_list.append((c_tZ * reg_weight_2d[None, :] * regularization_scale).flatten())
                 
             if len_lam > 0:
-                final_res_list.append((c_lam * jnp.sqrt(1e-6)).flatten())
+                final_res_list.append((c_lam * jnp.sqrt(1e-6) * regularization_scale).flatten())
                 
             return jnp.concatenate(final_res_list)
             
@@ -818,8 +862,12 @@ class VEQ3D_Solver:
         # =================================================================
         # [物理闭环终极修复 3]：卸载冗余 AL 外壳，交付原生雅可比推土机
         # =================================================================
-        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         proj_cfg = dict(projection_cfg or {})
+        self._last_projection_cfg = proj_cfg.copy()
+        self.main_dp_weight = float(proj_cfg.get("main_dp_weight", 0.0))
+        self.main_pressure_edge_weight = float(proj_cfg.get("main_pressure_edge_weight", 0.0))
+        self.main_profile_scale_floor = float(proj_cfg.get("main_profile_scale_floor", 1.0))
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         use_prox = bool(proj_cfg.get("enabled", False))
         outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
@@ -1277,6 +1325,80 @@ class VEQ3D_Solver:
             "svd_smax": smax,
         }
 
+    def metric_penalty_ratio(self, x_core, pressure_scale_factor=1.0):
+        """物理残差与惩罚/正则残差比例（禁用 scaling）。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        res_all = np.array(jax_res_fn(jnp.array(x_core), apply_scaling=False), dtype=float)
+        phys_len = self.num_core_params
+        res_phys = res_all[:phys_len]
+        res_pen = res_all[phys_len:]
+        norm_phys = float(np.linalg.norm(res_phys))
+        norm_pen = float(np.linalg.norm(res_pen))
+        ratio = norm_pen / (norm_phys + 1e-14)
+        return {
+            "norm_phys_unscaled": norm_phys,
+            "norm_penalty_unscaled": norm_pen,
+            "penalty_ratio": ratio,
+        }
+
+    def metric_scaling_masking(self, x_core, pressure_scale_factor=1.0):
+        """对比 scaled 与 unscaled 残差差距，监控缩放掩蔽。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        res_scaled = np.array(jax_res_fn(jnp.array(x_core), apply_scaling=True), dtype=float)
+        res_unscaled = np.array(jax_res_fn(jnp.array(x_core), apply_scaling=False), dtype=float)
+        norm_scaled = float(np.linalg.norm(res_scaled))
+        norm_unscaled = float(np.linalg.norm(res_unscaled))
+        return {
+            "norm_scaled": norm_scaled,
+            "norm_unscaled": norm_unscaled,
+            "masking_factor": norm_unscaled / (norm_scaled + 1e-14),
+        }
+
+    def metric_projection_disruption(self, x_core, projection_cfg=None, pressure_scale_factor=1.0):
+        """评估 proximal 投影对力平衡的扰动程度。"""
+        cfg = dict(projection_cfg or {})
+        if not cfg or not bool(cfg.get("enabled", False)):
+            return {"fb_before": 0.0, "fb_after": 0.0, "disruption_ratio": 1.0}
+        fb_before = self.metric_force_balance_rel(x_core, pressure_scale_factor)
+        x_proj, _ = self._apply_proximal_projection(x_core, pressure_scale_factor, cfg)
+        fb_after = self.metric_force_balance_rel(x_proj, pressure_scale_factor)
+        return {
+            "fb_before": float(fb_before),
+            "fb_after": float(fb_after),
+            "disruption_ratio": float(fb_after / (fb_before + 1e-14)),
+        }
+
+    def metric_directional_spectral_blocking(self, x_core):
+        """分离监控径向/角向谱阻塞，定位自由度不足方向。"""
+        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
+
+        def check_radial_blocking(c_arr):
+            if c_arr.shape[0] < 3:
+                return 0.0
+            e_all = np.sum(c_arr**2)
+            e_tail = np.sum(c_arr[-2:, :]**2)
+            return float(e_tail / (e_all + 1e-14))
+
+        def check_2d_angular_blocking(c_arr2d):
+            if self.len_2d == 0:
+                return 0.0
+            e_all = np.sum(c_arr2d**2)
+            tail_idx = []
+            for i, (m, n, typ) in enumerate(self.modes_2d):
+                if m == self.M_pol or abs(n) == self.N_tor:
+                    tail_idx.append(i)
+            if len(tail_idx) == 0:
+                return 0.0
+            e_tail = np.sum(c_arr2d[:, tail_idx] ** 2)
+            return float(e_tail / (e_all + 1e-14))
+
+        return {
+            "radial_blocking_R": check_radial_blocking(c_c0R) + check_radial_blocking(c_tR) if self.len_2d > 0 else check_radial_blocking(c_c0R),
+            "radial_blocking_Z": check_radial_blocking(c_c0Z) + check_radial_blocking(c_tZ) if self.len_2d > 0 else check_radial_blocking(c_c0Z),
+            "angular_blocking_R": check_2d_angular_blocking(c_tR) if self.len_2d > 0 else 0.0,
+            "angular_blocking_Z": check_2d_angular_blocking(c_tZ) if self.len_2d > 0 else 0.0,
+        }
+
     def metric_resolution_convergence(self, x_core, pressure_scale_factor=1.0, levels=None):
         if levels is None:
             levels = [
@@ -1305,7 +1427,7 @@ class VEQ3D_Solver:
     def _print_scalar_metric(self, name, value, target_text):
         print(f"    - {name:<32}: {value:>12.6e} | 目标最优值: {target_text}")
 
-    def run_validation_suite(self, x_core, pressure_scale_factor=1.0):
+    def run_validation_suite(self, x_core, pressure_scale_factor=1.0, projection_cfg=None):
         print("\n" + "=" * 70)
         print(">>> 运行平衡正确性验证指标套件")
         print("=" * 70)
@@ -1325,6 +1447,11 @@ class VEQ3D_Solver:
         tail = self.metric_spectral_tail_ratio(x_core)
         hist = self.metric_residual_drop_history()
         cond = self.metric_conditioning_proxy(x_core, pressure_scale_factor)
+        ppr = self.metric_penalty_ratio(x_core, pressure_scale_factor)
+        smf = self.metric_scaling_masking(x_core, pressure_scale_factor)
+        proj_cfg = projection_cfg if projection_cfg is not None else getattr(self, "_last_projection_cfg", None)
+        pdi = self.metric_projection_disruption(x_core, proj_cfg, pressure_scale_factor)
+        block = self.metric_directional_spectral_blocking(x_core)
         conv = self.metric_resolution_convergence(x_core, pressure_scale_factor)
 
         print(">>> 标量指标（直接数值 + 目标最优值）")
@@ -1356,6 +1483,36 @@ class VEQ3D_Solver:
         self._print_scalar_metric("residual_final", hist["final"], "接近 0 (越小越好)")
         self._print_scalar_metric("conditioning_col_ratio", cond["column_norm_ratio"], "尽可能小")
         self._print_scalar_metric("conditioning_svd_est", cond["svd_condition_est"], "尽可能小")
+
+        print(">>> 优化健康度与求解器诊断指标")
+        ppr_flag = "PASS" if ppr["penalty_ratio"] < 0.1 else ("WARN" if ppr["penalty_ratio"] < 1.0 else "FAIL")
+        smf_flag = "PASS" if smf["masking_factor"] < 1e2 else ("WARN" if smf["masking_factor"] < 1e4 else "FAIL")
+        pdi_flag = "PASS" if pdi["disruption_ratio"] < 1.2 else ("WARN" if pdi["disruption_ratio"] < 1.5 else "FAIL")
+        rb_max = max(block["radial_blocking_R"], block["radial_blocking_Z"])
+        ab_max = max(block["angular_blocking_R"], block["angular_blocking_Z"])
+        rb_flag = "PASS" if rb_max < 1e-3 else ("WARN" if rb_max < 1e-2 else "FAIL")
+        ab_flag = "PASS" if ab_max < 1e-3 else ("WARN" if ab_max < 1e-2 else "FAIL")
+
+        print(
+            f"    - physics_to_penalty_ratio        : {ppr['penalty_ratio']:.6e} "
+            f"[{ppr_flag}: 推荐 < 1e-1]"
+        )
+        print(
+            f"    - scaling_masking_factor          : {smf['masking_factor']:.6e} "
+            f"[{smf_flag}: 推荐 < 1e2]"
+        )
+        print(
+            f"    - projection_disruption_ratio     : {pdi['disruption_ratio']:.6e} "
+            f"[{pdi_flag}: 推荐 ~ 1]"
+        )
+        print(
+            f"    - radial_spectral_blocking_max    : {rb_max:.6e} "
+            f"[{rb_flag}: 推荐 < 1e-3]"
+        )
+        print(
+            f"    - angular_spectral_blocking_max   : {ab_max:.6e} "
+            f"[{ab_flag}: 推荐 < 1e-3]"
+        )
 
         fig = plt.figure(figsize=(16, 14))
         gs = fig.add_gridspec(3, 2)
@@ -1474,6 +1631,12 @@ class VEQ3D_Solver:
             "strength": 0.03,
             "boundary_strength": 0.05,
             "anchor_weight": 1e-2,
+            "dp_strength": 0.0,
+            "pressure_edge_strength": 0.0,
+            "pressure_axis_strength": 0.0,
+            "p_profile_strength": 0.0,
+            "main_dp_weight": 0.0,
+            "main_pressure_edge_weight": 0.0,
             "prox_max_nfev": 6,
             "prox_ftol": 1e-7,
         }
@@ -1498,6 +1661,12 @@ class VEQ3D_Solver:
             "strength": 0.08,
             "boundary_strength": 0.12,
             "anchor_weight": 5e-3,
+            "dp_strength": 0.35,
+            "pressure_edge_strength": 0.35,
+            "pressure_axis_strength": 0.0,
+            "p_profile_strength": 0.0,
+            "main_dp_weight": 0.15,
+            "main_pressure_edge_weight": 0.05,
             "prox_max_nfev": 8,
             "prox_ftol": 1e-8,
         }
@@ -1522,6 +1691,12 @@ class VEQ3D_Solver:
             "strength": 0.16,
             "boundary_strength": 0.24,
             "anchor_weight": 2e-3,
+            "dp_strength": 1.0,
+            "pressure_edge_strength": 0.8,
+            "pressure_axis_strength": 0.0,
+            "p_profile_strength": 0.0,
+            "main_dp_weight": 0.45,
+            "main_pressure_edge_weight": 0.15,
             "prox_max_nfev": 12,
             "prox_ftol": 1e-9,
         }
