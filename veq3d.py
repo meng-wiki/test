@@ -1158,14 +1158,6 @@ class VEQ3D_Solver:
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
         use_exact_jacobian = bool(proj_cfg.get("use_exact_jacobian", True))
         
-        @jax.jit
-        def fun_wrapped(x_arr):
-            return jax_res_fn(x_arr, apply_scaling=True)
-            
-        @jax.jit
-        def jac_wrapped(x_arr):
-            return jax.jacfwd(fun_wrapped)(x_arr)
-
         start_time = time.time()
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
         print(f"    >>> 雅可比模式: {'JAX 精确雅可比' if use_exact_jacobian else 'SciPy 2-point 数值雅可比'}")
@@ -1178,22 +1170,32 @@ class VEQ3D_Solver:
 
         active_idx = np.flatnonzero(~self.core_fixed_mask)
         n_active = int(active_idx.size)
+        active_idx_jnp = jnp.array(active_idx, dtype=jnp.int32)
+        fixed_mask_jnp = jnp.array(self.core_fixed_mask, dtype=bool)
+        fixed_values_jnp = jnp.array(self.core_fixed_values, dtype=float)
 
         def merge_active_to_full(x_active):
             x_full = self.core_fixed_values.copy() if np.any(self.core_fixed_mask) else np.zeros(self.num_core_params)
             x_full[active_idx] = np.asarray(x_active, dtype=float)
             return x_full
 
+        @jax.jit
+        def fun_active_wrapped(x_active_arr):
+            x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
+            x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+            return jax_res_fn(x_full, apply_scaling=True)
+
+        @jax.jit
+        def jac_active_wrapped(x_active_arr):
+            return jax.jacfwd(fun_active_wrapped)(x_active_arr)
+
         def fun_logged(x_arr):
-            x_full = merge_active_to_full(x_arr)
-            r = np.array(fun_wrapped(jnp.array(x_full)))
+            r = np.array(fun_active_wrapped(jnp.array(x_arr)))
             eval_hist.append(float(np.linalg.norm(r)))
             return r
 
         def jac_logged(x_arr):
-            x_full = merge_active_to_full(x_arr)
-            jac_full = np.array(jac_wrapped(jnp.array(x_full)))
-            return jac_full[:, active_idx]
+            return np.array(jac_active_wrapped(jnp.array(x_arr)))
 
         iter_counter = 0
 
