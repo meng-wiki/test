@@ -178,7 +178,7 @@ class VEQ3D_Solver:
         self.main_pressure_edge_weight = 0.0
         self.main_profile_scale_floor = 1.0
         # 各残差组分总权重（可在 projection_cfg 中按 phase 覆盖）
-        self.main_phys_weight = 100.0
+        self.main_phys_weight = 1.0
         self.profile_penalty_weight = 1.0
         self.reg_tR_weight = 1.0
         self.reg_tZ_weight = 1.0
@@ -1170,7 +1170,7 @@ class VEQ3D_Solver:
         self.main_dp_weight = float(proj_cfg.get("main_dp_weight", 0.0))
         self.main_pressure_edge_weight = float(proj_cfg.get("main_pressure_edge_weight", 0.0))
         self.main_profile_scale_floor = float(proj_cfg.get("main_profile_scale_floor", 1.0))
-        self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 100.0))
+        self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 1.0))
         self.profile_penalty_weight = float(proj_cfg.get("profile_penalty_weight", 1.0))
         self.reg_tR_weight = float(proj_cfg.get("reg_tR_weight", 1.0))
         self.reg_tZ_weight = float(proj_cfg.get("reg_tZ_weight", 1.0))
@@ -1225,6 +1225,8 @@ class VEQ3D_Solver:
         def iter_callback(intermediate_result):
             nonlocal iter_counter
             iter_counter += 1
+            if (iter_counter % 10) != 0:
+                return
             x_iter = merge_active_to_full(np.array(intermediate_result.x, dtype=float))
             en_iter = self.metric_global_energy_terms(x_iter, pressure_scale_factor)
             print(
@@ -1446,6 +1448,87 @@ class VEQ3D_Solver:
             "Jr_sup": Jr_sup, "Jt_sup": Jt_sup, "Jz_sup": Jz_sup, "Jr_phys": Jr_phys,
             "G_rho": G_rho, "F_rho": F_rho, "F_beta": F_beta,
             "g_rr": g_rr, "g_tt": g_tt, "g_zz": g_zz, "g_rt": g_rt, "g_rz": g_rz, "g_tz": g_tz
+        }
+
+    def _check_rho_derivative_stability(
+        self,
+        x_core=None,
+        pressure_scale_factor=0.0,
+        stage_label="当前模式",
+        raise_on_fail=True,
+    ):
+        """检查当前 M/N/L 下 R,Z 对 rho 的一阶导数在 rho=0 附近是否稳定。"""
+        x_eval = np.zeros(self.num_core_params, dtype=float) if x_core is None else np.asarray(x_core, dtype=float)
+        x_eval = self._apply_fixed_core(x_eval)
+        s = self._compute_state_numpy(x_eval, pressure_scale_factor=pressure_scale_factor)
+
+        rho_arr = np.asarray(self.rho, dtype=float)
+        Nr = int(rho_arr.size)
+        if Nr == 0:
+            raise RuntimeError("rho 网格为空，无法进行 rho=0 导数稳定性检查。")
+
+        axis_idx = int(np.argmin(np.abs(rho_arr)))
+        near_idx1 = min(axis_idx + 1, Nr - 1)
+        near_idx2 = min(axis_idx + 2, Nr - 1)
+        chk_idx = sorted(set([axis_idx, near_idx1, near_idx2]))
+
+        Rr = np.asarray(s["Rr"], dtype=float)
+        Zr = np.asarray(s["Zr"], dtype=float)
+        dmag = np.sqrt(Rr**2 + Zr**2)
+        sel = dmag[chk_idx, :, :]
+        finite_ok = bool(np.isfinite(sel).all())
+
+        axis_mag = dmag[axis_idx, :, :]
+        axis_mean = float(np.mean(np.abs(axis_mag)))
+        axis_std = float(np.std(axis_mag))
+        axis_rel_std = float(axis_std / (axis_mean + 1e-14))
+        near1_mean = float(np.mean(np.abs(dmag[near_idx1, :, :])))
+        near2_mean = float(np.mean(np.abs(dmag[near_idx2, :, :])))
+        jump_ratio_01 = float(near1_mean / (axis_mean + 1e-14))
+        jump_ratio_12 = float(near2_mean / (near1_mean + 1e-14))
+        max_abs = float(np.max(np.abs(sel)))
+
+        # 稳定性判据：避免 NaN/Inf 与明显数值爆炸。
+        stable = finite_ok and np.isfinite(max_abs) and (max_abs < 1e8)
+
+        print(
+            f">>> [rho-derivative-check][{stage_label}] "
+            f"(M={self.M_pol}, N={self.N_tor}, L={self.L_rad})"
+        )
+        print(
+            "    "
+            f"rho_idx={chk_idx}, |dX/drho|_axis_mean={axis_mean:.3e}, "
+            f"axis_rel_std={axis_rel_std:.3e}, jump01={jump_ratio_01:.3e}, jump12={jump_ratio_12:.3e}, "
+            f"max_abs={max_abs:.3e}, finite={finite_ok}"
+        )
+        if stable:
+            print("    >>> rho=0 一阶导数稳定性检查: 通过")
+            return {
+                "stable": True,
+                "axis_mean": axis_mean,
+                "axis_rel_std": axis_rel_std,
+                "jump_ratio_01": jump_ratio_01,
+                "jump_ratio_12": jump_ratio_12,
+                "max_abs": max_abs,
+                "indices": chk_idx,
+            }
+
+        msg = (
+            "rho=0 一阶导数稳定性检查失败："
+            f"finite={finite_ok}, max_abs={max_abs:.3e}, "
+            f"axis_rel_std={axis_rel_std:.3e}, jump01={jump_ratio_01:.3e}, jump12={jump_ratio_12:.3e}"
+        )
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        print(f"    >>> [WARN] {msg}")
+        return {
+            "stable": False,
+            "axis_mean": axis_mean,
+            "axis_rel_std": axis_rel_std,
+            "jump_ratio_01": jump_ratio_01,
+            "jump_ratio_12": jump_ratio_12,
+            "max_abs": max_abs,
+            "indices": chk_idx,
         }
 
     def _volume_weights(self, state):
@@ -2145,7 +2228,7 @@ class VEQ3D_Solver:
         print("="*70)
         self.update_grid(h_Nr, h_Nt, h_Nz)
         proj_phase3 = {
-            "enabled": True,
+            "enabled": False,
             "outer_loops": 2,
             "lsq_chunk_nfev": 800,
             "strength": 0.05,
@@ -2157,7 +2240,7 @@ class VEQ3D_Solver:
             "p_profile_strength": 0.0,
             "main_dp_weight": 0.5,
             "main_pressure_edge_weight": 0.2,
-            "main_phys_weight": 100.0,
+            "main_phys_weight": 10.0,
             "profile_penalty_weight": 0.1,
             "reg_tR_weight": 0.1,
             "reg_tZ_weight": 0.1,
@@ -2203,6 +2286,12 @@ class VEQ3D_Solver:
         pilot.update_grid(pilot.target_Nr, pilot.target_Nt, pilot.target_Nz)
         pilot.fit_boundary()
         pilot._initialize_scaling()
+        pilot._check_rho_derivative_stability(
+            x_core=np.zeros(pilot.num_core_params),
+            pressure_scale_factor=0.0,
+            stage_label="PreFilter-Pilot",
+            raise_on_fail=True,
+        )
 
         _, _, pilot_res, pilot_elapsed = pilot._run_three_phase_optimization(phase_title_prefix="[PreFilter] ")
         freeze_mask, freeze_vals = self._build_prefilter_freeze_mask(pilot, pilot_res.x, tol=tol)
@@ -2227,6 +2316,12 @@ class VEQ3D_Solver:
     def solve(self):
         print(">>> 启动 VEQ-3D 谱精度平衡求解器 (奇点相消无障碍版)...")
         self._reset_core_freeze_state()
+        self._check_rho_derivative_stability(
+            x_core=np.zeros(self.num_core_params),
+            pressure_scale_factor=0.0,
+            stage_label="Main-Solver-Precheck",
+            raise_on_fail=True,
+        )
         self._prefilter_from_low_order_case(tol=1e-6)
 
         res_phase1, res_phase2, res_fine, elapsed = self._run_three_phase_optimization()
