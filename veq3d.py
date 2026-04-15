@@ -180,6 +180,21 @@ class VEQ3D_Solver:
         # 各残差组分总权重（可在 projection_cfg 中按 phase 覆盖）
         self.main_phys_weight = 1.0
         self.profile_penalty_weight = 1.0
+        self.reg_theta_weight = 1.0
+        self.reg_lambda_weight = 1.0
+        # m/n/l 模态加权系数（对应 mode_weight_mnl 的 beta/gamma）
+        self.reg_beta_M = 1.0
+        self.reg_beta_N = 1.0
+        self.reg_beta_L = 1.0
+        self.reg_gamma_M = 1.0
+        self.reg_gamma_N = 1.0
+        self.reg_gamma_L = 1.0
+        # 各残差块按初值 RMS 归一化（避免量纲/维度混杂）
+        self.block_rms_phys = 1.0
+        self.block_rms_profile = 1.0
+        self.block_rms_reg_theta = 1.0
+        self.block_rms_reg_lam = 1.0
+        # 兼容旧命名
         self.reg_tR_weight = 1.0
         self.reg_tZ_weight = 1.0
         self.reg_lam_weight = 1.0
@@ -928,11 +943,10 @@ class VEQ3D_Solver:
         
         fac_rad, dfac_rad = jnp.array(self.fac_rad), jnp.array(self.dfac_rad)
         fac_lam_eval, fac_lam_proj = jnp.array(self.fac_lam_eval), jnp.array(self.fac_lam_proj)
-        rho_m_lam, reg_weight_2d = jnp.array(self.rho_m_lam), jnp.array(self.reg_weight_2d)
+        rho_m_lam = jnp.array(self.rho_m_lam)
 
         basis_1d_val_slice, basis_1d_dz_slice = jnp.array(self.basis_1d_val[:, 0, 0, :]), jnp.array(self.basis_1d_dz[:, 0, 0, :])
         basis_2d_val, basis_2d_dr = jnp.array(self.basis_2d_val), jnp.array(self.basis_2d_dr)
-        basis_2d_dth, basis_2d_dth = jnp.array(self.basis_2d_dth), jnp.array(self.basis_2d_dth) # Typo guard
         basis_2d_dth, basis_2d_dze = jnp.array(self.basis_2d_dth), jnp.array(self.basis_2d_dze)
         
         basis_lam_tz, basis_lam_dth, basis_lam_dze = jnp.array(self.basis_lam_val[:, 0, :, :]), jnp.array(self.basis_lam_dth[:, 0, :, :]), jnp.array(self.basis_lam_dze[:, 0, :, :])
@@ -945,9 +959,18 @@ class VEQ3D_Solver:
         main_profile_scale_floor = float(self.main_profile_scale_floor)
         main_phys_weight = float(self.main_phys_weight)
         profile_penalty_weight = float(self.profile_penalty_weight)
-        reg_tR_weight = float(self.reg_tR_weight)
-        reg_tZ_weight = float(self.reg_tZ_weight)
-        reg_lam_weight = float(self.reg_lam_weight)
+        reg_theta_weight = float(self.reg_theta_weight)
+        reg_lambda_weight = float(self.reg_lambda_weight)
+        beta_M = float(self.reg_beta_M)
+        beta_N = float(self.reg_beta_N)
+        beta_L = float(self.reg_beta_L)
+        gamma_M = float(self.reg_gamma_M)
+        gamma_N = float(self.reg_gamma_N)
+        gamma_L = float(self.reg_gamma_L)
+        block_rms_phys = float(max(getattr(self, "block_rms_phys", 1.0), 1e-14))
+        block_rms_profile = float(max(getattr(self, "block_rms_profile", 1.0), 1e-14))
+        block_rms_reg_theta = float(max(getattr(self, "block_rms_reg_theta", 1.0), 1e-14))
+        block_rms_reg_lam = float(max(getattr(self, "block_rms_reg_lam", 1.0), 1e-14))
         det_chirality = jnp.array(self.det_chirality)
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
@@ -955,19 +978,92 @@ class VEQ3D_Solver:
         core_fixed_mask_np = np.asarray(self.core_fixed_mask, dtype=bool)
         if core_fixed_mask_np.size != self.num_core_params:
             core_fixed_mask_np = np.zeros(self.num_core_params, dtype=bool)
-        off_tR = (6 * len_1d) * L_rad
-        off_tZ = off_tR + len_2d * L_rad
-        off_lam = off_tZ + len_2d * L_rad
-        if len_2d > 0:
-            reg_active_tR = jnp.array((~core_fixed_mask_np[off_tR:off_tR + len_2d * L_rad]).reshape((L_rad, len_2d)).astype(float))
-            reg_active_tZ = jnp.array((~core_fixed_mask_np[off_tZ:off_tZ + len_2d * L_rad]).reshape((L_rad, len_2d)).astype(float))
-        else:
-            reg_active_tR = jnp.zeros((L_rad, 0))
-            reg_active_tZ = jnp.zeros((L_rad, 0))
-        if len_lam > 0:
-            reg_active_lam = jnp.array((~core_fixed_mask_np[off_lam:off_lam + len_lam * L_rad]).reshape((L_rad, len_lam)).astype(float))
-        else:
-            reg_active_lam = jnp.zeros((L_rad, 0))
+        core_active_flat = (~core_fixed_mask_np).astype(float)
+        active_idx_off = 0
+
+        def get_active_mask(width):
+            nonlocal active_idx_off
+            if width <= 0:
+                return jnp.zeros((L_rad, 0))
+            size = int(L_rad * width)
+            out = core_active_flat[active_idx_off:active_idx_off + size].reshape((L_rad, width))
+            active_idx_off += size
+            return jnp.array(out)
+
+        reg_active_c0R = get_active_mask(len_1d)
+        reg_active_c0Z = get_active_mask(len_1d)
+        reg_active_h = get_active_mask(len_1d)
+        reg_active_v = get_active_mask(len_1d)
+        reg_active_k = get_active_mask(len_1d)
+        reg_active_a = get_active_mask(len_1d)
+        reg_active_tR = get_active_mask(len_2d)
+        reg_active_tZ = get_active_mask(len_2d)
+        reg_active_lam = get_active_mask(len_lam)
+
+        # 1D 模态对应 m=0，n=(0,1,1,2,2,...)，用于统一 m/n/l 正则权重
+        n_vals_1d = np.zeros(len_1d, dtype=float)
+        for i in range(1, len_1d):
+            n_vals_1d[i] = (i + 1) // 2
+        m_vals_1d = np.zeros(len_1d, dtype=float)
+        m_vals_2d = np.array([abs(m) for m, _n, _typ in self.modes_2d], dtype=float) if len_2d > 0 else np.array([], dtype=float)
+        n_vals_2d = np.array([abs(n) for _m, n, _typ in self.modes_2d], dtype=float) if len_2d > 0 else np.array([], dtype=float)
+        m_vals_lam = np.array([abs(m) for m, _n in self.lambda_modes], dtype=float) if len_lam > 0 else np.array([], dtype=float)
+        n_vals_lam = np.array([abs(n) for _m, n in self.lambda_modes], dtype=float) if len_lam > 0 else np.array([], dtype=float)
+        l_vals = jnp.arange(L_rad, dtype=float)[:, None]
+
+        def mode_weight_mnl(m, n, l, M, N):
+            wm = (m / max(M, 1))**4
+            wn = (n / max(N, 1))**4
+            wl = (l / max(L_rad, 1))**4
+            return wm, wn, wl
+
+        def weight_lambda(m, n, l, M, N, beta_M=1.0, beta_N=1.0, beta_L=1.0):
+            wm, wn, wl = mode_weight_mnl(m, n, l, M, N)
+            return 1.0 + beta_M * wm + beta_N * wn + beta_L * wl
+
+        def weight_theta(m, n, l, M, N, gamma_M=1.0, gamma_N=1.0, gamma_L=1.0):
+            wm, wn, wl = mode_weight_mnl(m, n, l, M, N)
+            return 1.0 + gamma_M * wm + gamma_N * wn + gamma_L * wl
+
+        theta_mode_weight_1d = (
+            weight_theta(
+                jnp.array(m_vals_1d)[None, :],
+                jnp.array(n_vals_1d)[None, :],
+                l_vals,
+                self.M_pol,
+                self.N_tor,
+                gamma_M=gamma_M,
+                gamma_N=gamma_N,
+                gamma_L=gamma_L,
+            )
+            if len_1d > 0 else jnp.zeros((L_rad, 0))
+        )
+        theta_mode_weight_2d = (
+            weight_theta(
+                jnp.array(m_vals_2d)[None, :],
+                jnp.array(n_vals_2d)[None, :],
+                l_vals,
+                self.M_pol,
+                self.N_tor,
+                gamma_M=gamma_M,
+                gamma_N=gamma_N,
+                gamma_L=gamma_L,
+            )
+            if len_2d > 0 else jnp.zeros((L_rad, 0))
+        )
+        lambda_mode_weight = (
+            weight_lambda(
+                jnp.array(m_vals_lam)[None, :],
+                jnp.array(n_vals_lam)[None, :],
+                l_vals,
+                self.M_pol,
+                self.N_tor,
+                beta_M=beta_M,
+                beta_N=beta_N,
+                beta_L=beta_L,
+            )
+            if len_lam > 0 else jnp.zeros((L_rad, 0))
+        )
             
         def jax_unpack_edge(p):
             idx = 2
@@ -982,7 +1078,7 @@ class VEQ3D_Solver:
         def spectral_grad_th(f): return jnp.real(jnp.fft.ifft(1j * k_th * jnp.fft.fft(f, axis=1), axis=1))
         def spectral_grad_ze(f): return jnp.real(jnp.fft.ifft(1j * k_ze * jnp.fft.fft(f, axis=2), axis=2))
 
-        def jax_res_fn(x_core, apply_scaling=True, apply_group_weights=True):
+        def jax_res_fn(x_core, apply_scaling=True, apply_group_weights=True, apply_block_normalization=True):
             e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
             c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
 
@@ -1113,6 +1209,8 @@ class VEQ3D_Solver:
 
             if apply_scaling:
                 phys_res = phys_res / res_scales
+            if apply_block_normalization:
+                phys_res = phys_res / block_rms_phys
             if apply_group_weights:
                 phys_res = main_phys_weight * phys_res
 
@@ -1138,23 +1236,38 @@ class VEQ3D_Solver:
             final_res_list = [phys_res]
             if len(profile_res_list) > 0:
                 profile_res = jnp.concatenate(profile_res_list)
+                if apply_block_normalization:
+                    profile_res = profile_res / block_rms_profile
                 if apply_group_weights:
                     profile_res = profile_penalty_weight * profile_res
                 final_res_list.append(profile_res)
             
+            reg_theta_parts = []
+            if len_1d > 0:
+                reg_theta_parts.append((c_c0R * theta_mode_weight_1d * reg_active_c0R * regularization_scale).flatten())
+                reg_theta_parts.append((c_c0Z * theta_mode_weight_1d * reg_active_c0Z * regularization_scale).flatten())
+                reg_theta_parts.append((c_h * theta_mode_weight_1d * reg_active_h * regularization_scale).flatten())
+                reg_theta_parts.append((c_v * theta_mode_weight_1d * reg_active_v * regularization_scale).flatten())
+                reg_theta_parts.append((c_k * theta_mode_weight_1d * reg_active_k * regularization_scale).flatten())
+                reg_theta_parts.append((c_a * theta_mode_weight_1d * reg_active_a * regularization_scale).flatten())
             if len_2d > 0:
-                reg_tR_res = (c_tR * reg_weight_2d[None, :] * reg_active_tR * regularization_scale).flatten()
-                reg_tZ_res = (c_tZ * reg_weight_2d[None, :] * reg_active_tZ * regularization_scale).flatten()
+                reg_theta_parts.append((c_tR * theta_mode_weight_2d * reg_active_tR * regularization_scale).flatten())
+                reg_theta_parts.append((c_tZ * theta_mode_weight_2d * reg_active_tZ * regularization_scale).flatten())
+
+            if len(reg_theta_parts) > 0:
+                reg_theta_res = jnp.concatenate(reg_theta_parts)
+                if apply_block_normalization:
+                    reg_theta_res = reg_theta_res / block_rms_reg_theta
                 if apply_group_weights:
-                    reg_tR_res = reg_tR_weight * reg_tR_res
-                    reg_tZ_res = reg_tZ_weight * reg_tZ_res
-                final_res_list.append(reg_tR_res)
-                final_res_list.append(reg_tZ_res)
-                
+                    reg_theta_res = reg_theta_weight * reg_theta_res
+                final_res_list.append(reg_theta_res)
+
             if len_lam > 0:
-                reg_lam_res = (c_lam * reg_active_lam * regularization_scale).flatten()
+                reg_lam_res = (c_lam * lambda_mode_weight * reg_active_lam * regularization_scale).flatten()
+                if apply_block_normalization:
+                    reg_lam_res = reg_lam_res / block_rms_reg_lam
                 if apply_group_weights:
-                    reg_lam_res = reg_lam_weight * reg_lam_res
+                    reg_lam_res = reg_lambda_weight * reg_lam_res
                 final_res_list.append(reg_lam_res)
                 
             return jnp.concatenate(final_res_list)
@@ -1172,14 +1285,42 @@ class VEQ3D_Solver:
         self.main_profile_scale_floor = float(proj_cfg.get("main_profile_scale_floor", 1.0))
         self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 1.0))
         self.profile_penalty_weight = float(proj_cfg.get("profile_penalty_weight", 1.0))
-        self.reg_tR_weight = float(proj_cfg.get("reg_tR_weight", 1.0))
-        self.reg_tZ_weight = float(proj_cfg.get("reg_tZ_weight", 1.0))
-        self.reg_lam_weight = float(proj_cfg.get("reg_lam_weight", 1.0))
-        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        legacy_tR = proj_cfg.get("reg_tR_weight", None)
+        legacy_tZ = proj_cfg.get("reg_tZ_weight", None)
+        if (legacy_tR is not None) or (legacy_tZ is not None):
+            vals = [float(v) for v in [legacy_tR, legacy_tZ] if v is not None]
+            legacy_theta = float(np.mean(vals)) if len(vals) > 0 else 1.0
+        else:
+            legacy_theta = 1.0
+        self.reg_theta_weight = float(proj_cfg.get("reg_theta_weight", legacy_theta))
+        self.reg_lambda_weight = float(proj_cfg.get("reg_lambda_weight", proj_cfg.get("reg_lam_weight", 1.0)))
+        self.reg_beta_M = float(proj_cfg.get("reg_beta_M", 1.0))
+        self.reg_beta_N = float(proj_cfg.get("reg_beta_N", 1.0))
+        self.reg_beta_L = float(proj_cfg.get("reg_beta_L", 1.0))
+        self.reg_gamma_M = float(proj_cfg.get("reg_gamma_M", 1.0))
+        self.reg_gamma_N = float(proj_cfg.get("reg_gamma_N", 1.0))
+        self.reg_gamma_L = float(proj_cfg.get("reg_gamma_L", 1.0))
+        base_main_phys_weight = self.main_phys_weight
+        base_profile_penalty_weight = self.profile_penalty_weight
+        base_reg_theta_weight = self.reg_theta_weight
+        base_reg_lambda_weight = self.reg_lambda_weight
+        use_block_rms_normalization = bool(proj_cfg.get("use_block_rms_normalization", True))
+        block_rms_floor = float(proj_cfg.get("block_rms_floor", 1e-8))
+        block_rms_probe_epsilon = float(proj_cfg.get("block_rms_probe_epsilon", 1e-3))
+        block_rms_probe_seed = proj_cfg.get("block_rms_probe_seed", None)
+        phys_weight_start_factor = float(proj_cfg.get("phys_weight_start_factor", 0.6))
+        profile_weight_start_factor = float(proj_cfg.get("profile_weight_start_factor", 1.0))
+        reg_theta_weight_start_factor = float(proj_cfg.get("reg_theta_weight_start_factor", 1.5))
+        reg_lambda_weight_start_factor = float(proj_cfg.get("reg_lambda_weight_start_factor", 1.5))
+        # 兼容旧字段，便于外部仍读取
+        self.reg_tR_weight = self.reg_theta_weight
+        self.reg_tZ_weight = self.reg_theta_weight
+        self.reg_lam_weight = self.reg_lambda_weight
         use_prox = bool(proj_cfg.get("enabled", False))
         outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
         use_exact_jacobian = bool(proj_cfg.get("use_exact_jacobian", True))
+        use_weight_continuation = bool(proj_cfg.get("use_weight_continuation", outer_loops > 1))
         
         start_time = time.time()
         print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
@@ -1201,24 +1342,6 @@ class VEQ3D_Solver:
             x_full = self.core_fixed_values.copy() if np.any(self.core_fixed_mask) else np.zeros(self.num_core_params)
             x_full[active_idx] = np.asarray(x_active, dtype=float)
             return x_full
-
-        @jax.jit
-        def fun_active_wrapped(x_active_arr):
-            x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
-            x_full = x_full.at[active_idx_jnp].set(x_active_arr)
-            return jax_res_fn(x_full, apply_scaling=True)
-
-        @jax.jit
-        def jac_active_wrapped(x_active_arr):
-            return jax.jacfwd(fun_active_wrapped)(x_active_arr)
-
-        def fun_logged(x_arr):
-            r = np.array(fun_active_wrapped(jnp.array(x_arr)))
-            eval_hist.append(float(np.linalg.norm(r)))
-            return r
-
-        def jac_logged(x_arr):
-            return np.array(jac_active_wrapped(jnp.array(x_arr)))
 
         iter_counter = 0
 
@@ -1248,17 +1371,150 @@ class VEQ3D_Solver:
         x_curr = self._apply_fixed_core(self._linear_constraint_project(np.array(x0, dtype=float)))
         total_nfev = 0
         res = None
+        jax_res_fn = None
+
+        def _set_outer_block_weights(outer_idx: int):
+            if use_weight_continuation and outer_loops > 1:
+                t = float(outer_idx) / float(max(outer_loops - 1, 1))
+                phys_factor = phys_weight_start_factor + (1.0 - phys_weight_start_factor) * t
+                profile_factor = profile_weight_start_factor + (1.0 - profile_weight_start_factor) * t
+                reg_theta_factor = reg_theta_weight_start_factor + (1.0 - reg_theta_weight_start_factor) * t
+                reg_lambda_factor = reg_lambda_weight_start_factor + (1.0 - reg_lambda_weight_start_factor) * t
+            else:
+                phys_factor = profile_factor = reg_theta_factor = reg_lambda_factor = 1.0
+            self.main_phys_weight = base_main_phys_weight * phys_factor
+            self.profile_penalty_weight = base_profile_penalty_weight * profile_factor
+            self.reg_theta_weight = base_reg_theta_weight * reg_theta_factor
+            self.reg_lambda_weight = base_reg_lambda_weight * reg_lambda_factor
+            self.reg_tR_weight = self.reg_theta_weight
+            self.reg_tZ_weight = self.reg_theta_weight
+            self.reg_lam_weight = self.reg_lambda_weight
+
+        def _build_fun_and_jac(jax_res_fn_local):
+            @jax.jit
+            def fun_active_wrapped(x_active_arr):
+                x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
+                x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+                return jax_res_fn_local(x_full, apply_scaling=True)
+
+            @jax.jit
+            def jac_active_wrapped(x_active_arr):
+                return jax.jacfwd(fun_active_wrapped)(x_active_arr)
+
+            def fun_logged(x_arr):
+                r = np.array(fun_active_wrapped(jnp.array(x_arr)))
+                eval_hist.append(float(np.linalg.norm(r)))
+                return r
+
+            def jac_logged(x_arr):
+                return np.array(jac_active_wrapped(jnp.array(x_arr)))
+
+            return fun_logged, jac_logged
+
+        if use_block_rms_normalization:
+            self.block_rms_phys = 1.0
+            self.block_rms_profile = 1.0
+            self.block_rms_reg_theta = 1.0
+            self.block_rms_reg_lam = 1.0
+            _set_outer_block_weights(0)
+            jax_res_fn_for_init = self._build_jax_residual_fn(pressure_scale_factor)
+            res_init = np.array(
+                jax_res_fn_for_init(
+                    jnp.array(x_curr),
+                    apply_scaling=True,
+                    apply_group_weights=False,
+                    apply_block_normalization=False,
+                ),
+                dtype=float,
+            )
+            phys_len = self.num_core_params
+            profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
+            reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
+            reg_lam_len = self.L_rad * self.len_lam
+
+            idx = 0
+            block_phys = res_init[idx:idx + phys_len]
+            idx += phys_len
+            block_profile = res_init[idx:idx + profile_len]
+            idx += profile_len
+            block_reg_theta = res_init[idx:idx + reg_theta_len]
+            idx += reg_theta_len
+            block_reg_lam = res_init[idx:idx + reg_lam_len]
+
+            # 对正则块使用“参数初始扰动 probe”估计 RMS，避免 x0=0 导致正则 RMS 退化为 floor
+            x_probe = np.array(x_curr, dtype=float).copy()
+            if n_active > 0 and block_rms_probe_epsilon > 0.0:
+                if block_rms_probe_seed is None:
+                    noise = np.random.randn(n_active)
+                else:
+                    noise = np.random.default_rng(int(block_rms_probe_seed)).standard_normal(n_active)
+                x_probe[active_idx] = x_probe[active_idx] + block_rms_probe_epsilon * noise
+                x_probe = self._apply_fixed_core(self._linear_constraint_project(x_probe))
+                res_probe = np.array(
+                    jax_res_fn_for_init(
+                        jnp.array(x_probe),
+                        apply_scaling=True,
+                        apply_group_weights=False,
+                        apply_block_normalization=False,
+                    ),
+                    dtype=float,
+                )
+                idx_probe = phys_len + profile_len
+                block_reg_theta = res_probe[idx_probe:idx_probe + reg_theta_len]
+                idx_probe += reg_theta_len
+                block_reg_lam = res_probe[idx_probe:idx_probe + reg_lam_len]
+
+            def _rms(v):
+                if v.size == 0:
+                    return 1.0
+                return float(max(np.linalg.norm(v) / np.sqrt(v.size), block_rms_floor))
+
+            self.block_rms_phys = _rms(block_phys)
+            self.block_rms_profile = _rms(block_profile)
+            self.block_rms_reg_theta = _rms(block_reg_theta)
+            self.block_rms_reg_lam = _rms(block_reg_lam)
+            print(
+                "    >>> [BlockRMSInit] "
+                f"phys={self.block_rms_phys:.3e}, "
+                f"profile={self.block_rms_profile:.3e}, "
+                f"reg_theta={self.block_rms_reg_theta:.3e}, "
+                f"reg_lambda={self.block_rms_reg_lam:.3e}"
+            )
+            if n_active > 0 and block_rms_probe_epsilon > 0.0:
+                print(
+                    "    >>> [BlockRMSProbe] "
+                    f"epsilon={block_rms_probe_epsilon:.3e}, "
+                    f"seed={'None' if block_rms_probe_seed is None else int(block_rms_probe_seed)}"
+                )
+        else:
+            self.block_rms_phys = 1.0
+            self.block_rms_profile = 1.0
+            self.block_rms_reg_theta = 1.0
+            self.block_rms_reg_lam = 1.0
+            print("    >>> [BlockRMSInit] 已禁用块归一化，沿用原始尺度。")
 
         if n_active == 0:
             print("    >>> 核心参数冻结: 0 个自由变量（全部固定），跳过 least_squares。")
             res = SimpleNamespace(x=x_curr.copy(), nfev=0, success=True, status=1, message="all variables fixed")
+            _set_outer_block_weights(max(outer_loops - 1, 0))
+            jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
 
         for outer in range(outer_loops if n_active > 0 else 0):
             budget_left = max_nfev - total_nfev
             if budget_left <= 0:
                 break
             this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
+            _set_outer_block_weights(outer)
+            jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+            fun_logged, jac_logged = _build_fun_and_jac(jax_res_fn)
             print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
+            print(
+                "    >>> [WeightSchedule] "
+                f"main_phys={self.main_phys_weight:.3e}, "
+                f"profile={self.profile_penalty_weight:.3e}, "
+                f"reg_theta={self.reg_theta_weight:.3e}, "
+                f"reg_lambda={self.reg_lambda_weight:.3e}"
+            )
             try:
                 x_active0 = x_curr[active_idx]
                 res = least_squares(
@@ -1783,7 +2039,7 @@ class VEQ3D_Solver:
         }
 
     def metric_penalty_breakdown(self, x_core, pressure_scale_factor=1.0):
-        """将惩罚项拆分为 profile/reg_tR/reg_tZ/reg_lam 四类（禁用 scaling）。"""
+        """将惩罚项拆分为 profile/reg_theta(非Lambda)/reg_lambda 三类（禁用 scaling）。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         x_eff = self._apply_fixed_core(x_core)
         res_all = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
@@ -1792,29 +2048,25 @@ class VEQ3D_Solver:
         res_pen_all = res_all[phys_len:]
 
         profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
-        reg_tR_len = self.L_rad * self.len_2d
-        reg_tZ_len = self.L_rad * self.len_2d
+        reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
         reg_lam_len = self.L_rad * self.len_lam
 
         idx = 0
         res_profile = res_pen_all[idx:idx + profile_len]
         idx += profile_len
-        res_reg_tR = res_pen_all[idx:idx + reg_tR_len]
-        idx += reg_tR_len
-        res_reg_tZ = res_pen_all[idx:idx + reg_tZ_len]
-        idx += reg_tZ_len
+        res_reg_theta = res_pen_all[idx:idx + reg_theta_len]
+        idx += reg_theta_len
         res_reg_lam = res_pen_all[idx:idx + reg_lam_len]
 
-        res_pen = np.concatenate([res_profile, res_reg_tR, res_reg_tZ, res_reg_lam]) if (
-            (res_profile.size + res_reg_tR.size + res_reg_tZ.size + res_reg_lam.size) > 0
+        res_pen = np.concatenate([res_profile, res_reg_theta, res_reg_lam]) if (
+            (res_profile.size + res_reg_theta.size + res_reg_lam.size) > 0
         ) else np.array([], dtype=float)
         norm_phys = float(np.linalg.norm(res_phys))
         norm_pen = float(np.linalg.norm(res_pen))
         return {
             "norm_phys_unscaled": norm_phys,
             "norm_profile_penalty_unscaled": float(np.linalg.norm(res_profile)),
-            "norm_reg_tR_unscaled": float(np.linalg.norm(res_reg_tR)),
-            "norm_reg_tZ_unscaled": float(np.linalg.norm(res_reg_tZ)),
+            "norm_reg_theta_unscaled": float(np.linalg.norm(res_reg_theta)),
             "norm_reg_lam_unscaled": float(np.linalg.norm(res_reg_lam)),
             "norm_penalty_unscaled": norm_pen,
         }
@@ -1861,15 +2113,13 @@ class VEQ3D_Solver:
 
         phys_len = self.num_core_params
         profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
-        reg_tR_len = self.L_rad * self.len_2d
-        reg_tZ_len = self.L_rad * self.len_2d
+        reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
         reg_lam_len = self.L_rad * self.len_lam
 
         groups_meta = [
             ("main_phys", "主物理残差", phys_len),
             ("profile_penalty", "剖面约束惩罚", profile_len),
-            ("reg_tR", "正则项 tR", reg_tR_len),
-            ("reg_tZ", "正则项 tZ", reg_tZ_len),
+            ("reg_theta", "正则项 Theta(非Lambda)", reg_theta_len),
             ("reg_lam", "正则项 Lambda", reg_lam_len),
         ]
 
@@ -2042,8 +2292,7 @@ class VEQ3D_Solver:
             f"[{ppr_flag}: 推荐 < 1e-1]"
         )
         print(f"    - profile_penalty                 : {pbd['norm_profile_penalty_unscaled']:.6e}")
-        print(f"    - reg_tR                          : {pbd['norm_reg_tR_unscaled']:.6e}")
-        print(f"    - reg_tZ                          : {pbd['norm_reg_tZ_unscaled']:.6e}")
+        print(f"    - reg_theta_non_lambda            : {pbd['norm_reg_theta_unscaled']:.6e}")
         print(f"    - reg_lam                         : {pbd['norm_reg_lam_unscaled']:.6e}")
         print(
             f"    - scaling_masking_factor          : {smf['masking_factor']:.6e} "
