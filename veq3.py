@@ -173,35 +173,25 @@ class VEQ3D_Solver:
         self.det_chirality = 1.0
         # 正则项总开关缩放，避免其在物理残差前喧宾夺主
         self.regularization_scale = 0.5
-        # 主残差中的剖面约束权重（默认关闭，仅在 _run_optimization 中按 phase 注入）
-        self.main_dp_weight = 0.0
-        self.main_pressure_edge_weight = 0.0
-        self.main_profile_scale_floor = 1.0
         # 各残差组分总权重（可在 projection_cfg 中按 phase 覆盖）
         self.main_phys_weight = 1.0
-        self.profile_penalty_weight = 1.0
-        self.reg_theta_weight = 1.0
-        self.reg_lambda_weight = 1.0
-        # m/n/l 模态加权系数（对应 mode_weight_mnl 的 beta/gamma）
-        self.reg_beta_M = 1.0
-        self.reg_beta_N = 1.0
-        self.reg_beta_L = 1.0
-        self.reg_gamma_M = 1.0
-        self.reg_gamma_N = 1.0
-        self.reg_gamma_L = 1.0
+        self.alpha_1d = 1.0
+        self.alpha_tR = 1.0
+        self.alpha_tZ = 1.0
+        self.alpha_lam = 1.0
+        # 谱正则权重指数（默认：tR/tZ 仅 L^4；Lambda 采用 m^2*n^2*l^4）
+        self.theta_l_power = 4.0
+        self.lam_m_power = 2.0
+        self.lam_n_power = 2.0
+        self.lam_l_power = 4.0
         # 各残差块按初值 RMS 归一化（避免量纲/维度混杂）
         self.block_rms_phys = 1.0
-        self.block_rms_profile = 1.0
-        self.block_rms_reg_theta = 1.0
-        self.block_rms_reg_lam = 1.0
         # 兼容旧命名
+        self.reg_theta_weight = 1.0
+        self.reg_lambda_weight = 1.0
         self.reg_tR_weight = 1.0
         self.reg_tZ_weight = 1.0
         self.reg_lam_weight = 1.0
-        # 线性约束 A x = b（LinearConstraintProjection）；默认无约束
-        self.linear_constraint_A = None
-        self.linear_constraint_b = None
-        self.linear_constraint_tol = 1e-10
         
         self._setup_modes()
         
@@ -649,8 +639,31 @@ class VEQ3D_Solver:
     def _initialize_scaling(self):
         print(f">>> 参数体系已重构: 空间维度 (M={self.M_pol}, N={self.N_tor}, L={self.L_rad})")
         print(f">>> 总核心参数量: {self.num_core_params} 个")
-        # 不再使用超大数值缩放，避免梯度容差误判导致提前停止
+        # 物理残差缩放（保持与历史兼容）
         self.res_scales = np.ones(self.num_core_params)
+        # 变量块缩放（优化器工作在 scaled 空间，避免条件数过大）
+        self.var_scales = self._default_variable_scales()
+
+    def _default_variable_scales(self):
+        scales = np.ones(self.num_core_params, dtype=float)
+        # 经验初值：R/Z 类几何块较大，tR/tZ 中等，Lambda 偏高
+        block_defaults = {
+            "c0R": 10.0,
+            "c0Z": 10.0,
+            "h": 10.0,
+            "v": 10.0,
+            "k": 10.0,
+            "a": 10.0,
+            "tR": 1.0,
+            "tZ": 1.0,
+            "lam": 5.0,
+        }
+        for name, offset, width in self._iter_core_blocks():
+            if width <= 0:
+                continue
+            val = float(block_defaults.get(name, 1.0))
+            scales[offset:offset + self.L_rad * width] = val
+        return scales
 
     def compute_psi(self, rho):
         """极向磁通 ψ(ρ)，与 _get_profiles 中 psip=dψ/dρ 保持一致。"""
@@ -662,7 +675,8 @@ class VEQ3D_Solver:
 
     def _get_profiles(self, rho, pressure_scale_factor):
         """剖面输入：P(ρ), dP/dρ, dphi/dρ(Phip), dpsi/dρ(psip)。"""
-        P_scale = 1.8e4
+        # P_scale = 1.8e4
+        P_scale = 0
         # p 仅为 ψ_N 的函数：(ψ_N−1)² 在边界 ψ_N=1 处为零
         P = pressure_scale_factor * P_scale * (rho**2 - 1)**2
         dP_drho = pressure_scale_factor * P_scale * 4 * rho * (rho**2 - 1)
@@ -671,35 +685,6 @@ class VEQ3D_Solver:
         Phip = 2 * rho * self.Phi_a
         psip = iota * Phip
         return P, dP_drho, Phip, psip
-
-    def configure_linear_constraints(self, A: Optional[np.ndarray], b: Optional[np.ndarray]):
-        """配置线性等式约束 A x = b；传 None 则清空。"""
-        if A is None or b is None:
-            self.linear_constraint_A = None
-            self.linear_constraint_b = None
-            return
-        A = np.asarray(A, dtype=float)
-        b = np.asarray(b, dtype=float).reshape(-1)
-        if A.ndim != 2 or A.shape[1] != self.num_core_params:
-            raise ValueError("A 形状必须为 (m, num_core_params)")
-        if b.shape[0] != A.shape[0]:
-            raise ValueError("b 长度必须与 A 行数一致")
-        self.linear_constraint_A = A
-        self.linear_constraint_b = b
-
-    def _linear_constraint_project(self, x_core):
-        """将 x 投影到 A x = b（最小二乘意义下最近点）。"""
-        if self.linear_constraint_A is None or self.linear_constraint_b is None:
-            return np.asarray(x_core, dtype=float)
-        A = self.linear_constraint_A
-        b = self.linear_constraint_b
-        x = np.asarray(x_core, dtype=float)
-        r = A @ x - b
-        if np.linalg.norm(r) <= self.linear_constraint_tol:
-            return x
-        AA_t = A @ A.T
-        lam, *_ = np.linalg.lstsq(AA_t, r, rcond=None)
-        return x - A.T @ lam
 
     def _radial_integrate_forward(self, y, y0=0.0):
         out = np.zeros_like(y, dtype=float)
@@ -712,121 +697,6 @@ class VEQ3D_Solver:
     def _surface_mean_tz(self, f_rtz):
         """对每个 rho 磁面做 (theta, zeta) 平均，避免广播分母陷阱。"""
         return np.mean(f_rtz, axis=(1, 2))
-
-    def _profile_projection_data(self, x_core, pressure_scale_factor):
-        """构造 proximal 投影所需的重构剖面与目标剖面。"""
-        s = self._compute_state_numpy(x_core, pressure_scale_factor)
-
-        dP_est = self._surface_mean_tz(
-            s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0
-        )
-        dP_tar = self._surface_mean_tz(s["dP"])
-        P_tar = self._surface_mean_tz(s["P"])
-
-        Phip_est_3d = 2 * np.pi * s["sqrt_g"] * s["Bz_sup"] - s["Lt"]
-        psip_est_3d = self.N_fp * (2 * np.pi * s["sqrt_g"] * s["Bt_sup"] + s["Lz"])
-        Phip_est = self._surface_mean_tz(Phip_est_3d)
-        psip_est = self._surface_mean_tz(psip_est_3d)
-
-        Phip_tar = self._surface_mean_tz(s["Phip"])
-        psip_tar = self._surface_mean_tz(s["psip"])
-
-        # rho 网格从 rho[0] > 0 开始，补偿 [0, rho0] 的梯形面积可减小常数偏置
-        phi_est = self._radial_integrate_forward(Phip_est, y0=0.5 * float(Phip_est[0]) * self.rho[0])
-        psi_est = self._radial_integrate_forward(psip_est, y0=0.5 * float(psip_est[0]) * self.rho[0])
-        phi_tar = self.Phi_a * self.rho**2
-        psi_tar = self.compute_psi(self.rho)
-
-        # 用目标轴压强作为锚点，由 dP_est 前向积分检查边界 P(1)=0 约束
-        P_est = self._radial_integrate_forward(dP_est, y0=float(P_tar[0]))
-
-        return {
-            "dP_est": dP_est,
-            "dP_tar": dP_tar,
-            "P_tar": P_tar,
-            "P_est": P_est,
-            "Phip_est": Phip_est,
-            "Phip_tar": Phip_tar,
-            "psip_est": psip_est,
-            "psip_tar": psip_tar,
-            "phi_est": phi_est,
-            "phi_tar": phi_tar,
-            "psi_est": psi_est,
-            "psi_tar": psi_tar,
-        }
-
-    def _apply_proximal_projection(self, x_core, pressure_scale_factor, projection_cfg: Optional[Dict[str, Any]] = None):
-        """非线性约束投影：匹配 Phip/psip/dP + 关键边界条件。"""
-        cfg = dict(projection_cfg or {})
-        if not bool(cfg.get("enabled", False)):
-            return np.asarray(x_core, dtype=float), {"applied": False}
-
-        strength = float(cfg.get("strength", 0.1))
-        boundary_strength = float(cfg.get("boundary_strength", 0.2))
-        anchor_weight = float(cfg.get("anchor_weight", 1e-3))
-        use_flux_integral_constraints = bool(cfg.get("use_flux_integral_constraints", False))
-        flux_strength = float(cfg.get("flux_strength", strength))
-        dp_strength = float(cfg.get("dp_strength", strength))
-        p_profile_strength = float(cfg.get("p_profile_strength", 0.0))
-        pressure_edge_strength = float(cfg.get("pressure_edge_strength", boundary_strength))
-        pressure_axis_strength = float(cfg.get("pressure_axis_strength", 0.0))
-        profile_scale_floor = float(cfg.get("profile_scale_floor", 1.0))
-        prox_max_nfev = int(cfg.get("prox_max_nfev", 10))
-        prox_ftol = float(cfg.get("prox_ftol", 1e-8))
-
-        x_ref = np.asarray(x_core, dtype=float).copy()
-
-        def prox_residual(x_trial):
-            d = self._profile_projection_data(x_trial, pressure_scale_factor)
-            out = []
-
-            s_p = max(np.sqrt(np.mean(d["Phip_tar"] ** 2)), profile_scale_floor) + 1e-14
-            s_s = max(np.sqrt(np.mean(d["psip_tar"] ** 2)), profile_scale_floor) + 1e-14
-            s_d = max(np.sqrt(np.mean(d["dP_tar"] ** 2)), profile_scale_floor) + 1e-14
-            s_P = max(np.sqrt(np.mean(d["P_tar"] ** 2)), profile_scale_floor) + 1e-14
-
-            out.extend((flux_strength * (d["Phip_est"] - d["Phip_tar"]) / s_p).tolist())
-            out.extend((flux_strength * (d["psip_est"] - d["psip_tar"]) / s_s).tolist())
-            out.extend((dp_strength * (d["dP_est"] - d["dP_tar"]) / s_d).tolist())
-
-            # 可选：积分型通量约束（默认关闭，避免离散积分误差反向污染 proximal）
-            if use_flux_integral_constraints:
-                out.extend((strength * (d["phi_est"] - d["phi_tar"]) / (abs(self.Phi_a) + 1e-14)).tolist())
-                out.extend((strength * (d["psi_est"] - d["psi_tar"]) / (abs(d["psi_tar"][-1]) + 1e-14)).tolist())
-                out.append(boundary_strength * (d["phi_est"][-1] - self.Phi_a) / (abs(self.Phi_a) + 1e-14))
-                out.append(boundary_strength * d["psi_est"][0])
-            # 推荐策略：强约束 dP + 边界锚点 P(1)=0；P 全剖面仅可选弱约束
-            out.append(pressure_edge_strength * d["P_est"][-1] / s_P)
-            if pressure_axis_strength > 0:
-                out.append(pressure_axis_strength * (d["P_est"][0] - d["P_tar"][0]) / s_P)
-            if p_profile_strength > 0:
-                out.extend((p_profile_strength * (d["P_est"] - d["P_tar"]) / s_P).tolist())
-
-            if anchor_weight > 0:
-                x_scale = np.maximum(np.abs(x_ref), 1.0)
-                out.extend((np.sqrt(anchor_weight) * (x_trial - x_ref) / x_scale).tolist())
-
-            return np.asarray(out, dtype=float)
-
-        prox_res0 = prox_residual(x_ref)
-        prox_sol = least_squares(
-            prox_residual,
-            x_ref,
-            method="trf",
-            xtol=prox_ftol,
-            ftol=prox_ftol,
-            max_nfev=prox_max_nfev,
-            verbose=0,
-        )
-        x_proj = np.asarray(prox_sol.x, dtype=float)
-        prox_res1 = prox_residual(x_proj)
-        info = {
-            "applied": True,
-            "nfev": int(prox_sol.nfev),
-            "before_norm": float(np.linalg.norm(prox_res0)),
-            "after_norm": float(np.linalg.norm(prox_res1)),
-        }
-        return x_proj, info
 
     def fit_boundary(self):
         TH_F, ZE_F = self.TH[0], self.ZE[0]
@@ -939,7 +809,7 @@ class VEQ3D_Solver:
 
     def _build_jax_residual_fn(self, pressure_scale_factor=1.0):
         RHO, TH, ZE = jnp.array(self.RHO), jnp.array(self.TH), jnp.array(self.ZE)
-        rho_1d, D_matrix = jnp.array(self.rho), jnp.array(self.D_matrix)
+        D_matrix = jnp.array(self.D_matrix)
         
         fac_rad, dfac_rad = jnp.array(self.fac_rad), jnp.array(self.dfac_rad)
         fac_lam_eval, fac_lam_proj = jnp.array(self.fac_lam_eval), jnp.array(self.fac_lam_proj)
@@ -954,23 +824,17 @@ class VEQ3D_Solver:
         k_th, k_ze, weights_3d = jnp.array(self.k_th), jnp.array(self.k_ze), jnp.array(self.weights_3d)
         res_scales, p_edge = jnp.array(self.res_scales), jnp.array(self.p_edge)
         regularization_scale = float(self.regularization_scale)
-        main_dp_weight = float(self.main_dp_weight)
-        main_pressure_edge_weight = float(self.main_pressure_edge_weight)
-        main_profile_scale_floor = float(self.main_profile_scale_floor)
         main_phys_weight = float(self.main_phys_weight)
-        profile_penalty_weight = float(self.profile_penalty_weight)
-        reg_theta_weight = float(self.reg_theta_weight)
-        reg_lambda_weight = float(self.reg_lambda_weight)
-        beta_M = float(self.reg_beta_M)
-        beta_N = float(self.reg_beta_N)
-        beta_L = float(self.reg_beta_L)
-        gamma_M = float(self.reg_gamma_M)
-        gamma_N = float(self.reg_gamma_N)
-        gamma_L = float(self.reg_gamma_L)
+        alpha_1d = float(self.alpha_1d)
+        alpha_tR = float(self.alpha_tR)
+        alpha_tZ = float(self.alpha_tZ)
+        alpha_lam = float(self.alpha_lam)
+        theta_l_power = float(self.theta_l_power)
+        lam_m_power = float(self.lam_m_power)
+        lam_n_power = float(self.lam_n_power)
+        lam_l_power = float(self.lam_l_power)
         block_rms_phys = float(max(getattr(self, "block_rms_phys", 1.0), 1e-14))
         block_rms_profile = float(max(getattr(self, "block_rms_profile", 1.0), 1e-14))
-        block_rms_reg_theta = float(max(getattr(self, "block_rms_reg_theta", 1.0), 1e-14))
-        block_rms_reg_lam = float(max(getattr(self, "block_rms_reg_lam", 1.0), 1e-14))
         det_chirality = jnp.array(self.det_chirality)
         
         L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
@@ -1011,59 +875,20 @@ class VEQ3D_Solver:
         n_vals_lam = np.array([abs(n) for _m, n in self.lambda_modes], dtype=float) if len_lam > 0 else np.array([], dtype=float)
         l_vals = jnp.arange(L_rad, dtype=float)[:, None]
 
-        def mode_weight_mnl(m, n, l, M, N):
-            wm = (m / max(M, 1))**4
-            wn = (n / max(N, 1))**4
-            wl = (l / max(L_rad, 1))**4
-            return wm, wn, wl
-
-        def weight_lambda(m, n, l, M, N, beta_M=1.0, beta_N=1.0, beta_L=1.0):
-            wm, wn, wl = mode_weight_mnl(m, n, l, M, N)
-            return 1.0 + beta_M * wm + beta_N * wn + beta_L * wl
-
-        def weight_theta(m, n, l, M, N, gamma_M=1.0, gamma_N=1.0, gamma_L=1.0):
-            wm, wn, wl = mode_weight_mnl(m, n, l, M, N)
-            return 1.0 + gamma_M * wm + gamma_N * wn + gamma_L * wl
-
-        theta_mode_weight_1d = (
-            weight_theta(
-                jnp.array(m_vals_1d)[None, :],
-                jnp.array(n_vals_1d)[None, :],
-                l_vals,
-                self.M_pol,
-                self.N_tor,
-                gamma_M=gamma_M,
-                gamma_N=gamma_N,
-                gamma_L=gamma_L,
+        l_norm = l_vals / max(L_rad, 1)
+        theta_l_weight = jnp.power(jnp.maximum(l_norm, 0.0), theta_l_power)
+        theta_mode_weight_1d = jnp.broadcast_to(theta_l_weight, (L_rad, len_1d)) if len_1d > 0 else jnp.zeros((L_rad, 0))
+        theta_mode_weight_2d = jnp.broadcast_to(theta_l_weight, (L_rad, len_2d)) if len_2d > 0 else jnp.zeros((L_rad, 0))
+        if len_lam > 0:
+            m_norm_lam = jnp.array(m_vals_lam)[None, :] / max(self.M_pol + 1, 1)
+            n_norm_lam = jnp.array(n_vals_lam)[None, :] / max(self.N_tor, 1)
+            lambda_mode_weight = (
+                jnp.power(jnp.maximum(m_norm_lam, 0.0), lam_m_power)
+                * jnp.power(jnp.maximum(n_norm_lam, 0.0), lam_n_power)
+                * jnp.power(jnp.maximum(l_norm, 0.0), lam_l_power)
             )
-            if len_1d > 0 else jnp.zeros((L_rad, 0))
-        )
-        theta_mode_weight_2d = (
-            weight_theta(
-                jnp.array(m_vals_2d)[None, :],
-                jnp.array(n_vals_2d)[None, :],
-                l_vals,
-                self.M_pol,
-                self.N_tor,
-                gamma_M=gamma_M,
-                gamma_N=gamma_N,
-                gamma_L=gamma_L,
-            )
-            if len_2d > 0 else jnp.zeros((L_rad, 0))
-        )
-        lambda_mode_weight = (
-            weight_lambda(
-                jnp.array(m_vals_lam)[None, :],
-                jnp.array(n_vals_lam)[None, :],
-                l_vals,
-                self.M_pol,
-                self.N_tor,
-                beta_M=beta_M,
-                beta_N=beta_N,
-                beta_L=beta_L,
-            )
-            if len_lam > 0 else jnp.zeros((L_rad, 0))
-        )
+        else:
+            lambda_mode_weight = jnp.zeros((L_rad, 0))
             
         def jax_unpack_edge(p):
             idx = 2
@@ -1214,33 +1039,7 @@ class VEQ3D_Solver:
             if apply_group_weights:
                 phys_res = main_phys_weight * phys_res
 
-            # 将 dP 剖面约束直接并入主残差，避免“主优化-投影”循环互相抵消
-            profile_res_list = []
-            if (main_dp_weight > 0.0) or (main_pressure_edge_weight > 0.0):
-                dP_recon_3d = sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / mu_0
-                dP_recon_surf = jnp.mean(dP_recon_3d, axis=(1, 2))
-                dP_tar_surf = jnp.mean(dP, axis=(1, 2))
-                s_d = jnp.maximum(jnp.sqrt(jnp.mean(dP_tar_surf**2)), main_profile_scale_floor) + 1e-14
-
-                if main_dp_weight > 0.0:
-                    profile_res_list.append(main_dp_weight * (dP_recon_surf - dP_tar_surf) / s_d)
-
-                if main_pressure_edge_weight > 0.0:
-                    P_tar_surf = jnp.mean(P, axis=(1, 2))
-                    dr = rho_1d[1:] - rho_1d[:-1]
-                    dP_mid = 0.5 * (dP_recon_surf[1:] + dP_recon_surf[:-1])
-                    P_edge_est = P_tar_surf[0] + jnp.sum(dP_mid * dr)
-                    s_P = jnp.maximum(jnp.sqrt(jnp.mean(P_tar_surf**2)), main_profile_scale_floor) + 1e-14
-                    profile_res_list.append(jnp.array([main_pressure_edge_weight * (P_edge_est / s_P)]))
-                
             final_res_list = [phys_res]
-            if len(profile_res_list) > 0:
-                profile_res = jnp.concatenate(profile_res_list)
-                if apply_block_normalization:
-                    profile_res = profile_res / block_rms_profile
-                if apply_group_weights:
-                    profile_res = profile_penalty_weight * profile_res
-                final_res_list.append(profile_res)
             
             reg_theta_parts = []
             if len_1d > 0:
@@ -1255,19 +1054,28 @@ class VEQ3D_Solver:
                 reg_theta_parts.append((c_tZ * theta_mode_weight_2d * reg_active_tZ * regularization_scale).flatten())
 
             if len(reg_theta_parts) > 0:
-                reg_theta_res = jnp.concatenate(reg_theta_parts)
-                if apply_block_normalization:
-                    reg_theta_res = reg_theta_res / block_rms_reg_theta
-                if apply_group_weights:
-                    reg_theta_res = reg_theta_weight * reg_theta_res
-                final_res_list.append(reg_theta_res)
+                reg_theta_group = []
+                if len_1d > 0:
+                    reg_1d_res = jnp.concatenate(reg_theta_parts[:6]) if len(reg_theta_parts) >= 6 else jnp.array([])
+                    if reg_1d_res.size > 0:
+                        if apply_group_weights:
+                            reg_1d_res = alpha_1d * reg_1d_res
+                        reg_theta_group.append(reg_1d_res)
+                if len_2d > 0:
+                    reg_tR_res = (c_tR * theta_mode_weight_2d * reg_active_tR * regularization_scale).flatten()
+                    reg_tZ_res = (c_tZ * theta_mode_weight_2d * reg_active_tZ * regularization_scale).flatten()
+                    if apply_group_weights:
+                        reg_tR_res = alpha_tR * reg_tR_res
+                        reg_tZ_res = alpha_tZ * reg_tZ_res
+                    reg_theta_group.append(reg_tR_res)
+                    reg_theta_group.append(reg_tZ_res)
+                if len(reg_theta_group) > 0:
+                    final_res_list.append(jnp.concatenate(reg_theta_group))
 
             if len_lam > 0:
                 reg_lam_res = (c_lam * lambda_mode_weight * reg_active_lam * regularization_scale).flatten()
-                if apply_block_normalization:
-                    reg_lam_res = reg_lam_res / block_rms_reg_lam
                 if apply_group_weights:
-                    reg_lam_res = reg_lambda_weight * reg_lam_res
+                    reg_lam_res = alpha_lam * reg_lam_res
                 final_res_list.append(reg_lam_res)
                 
             return jnp.concatenate(final_res_list)
@@ -1280,44 +1088,42 @@ class VEQ3D_Solver:
         # =================================================================
         proj_cfg = dict(projection_cfg or {})
         self._last_projection_cfg = proj_cfg.copy()
-        self.main_dp_weight = float(proj_cfg.get("main_dp_weight", 0.0))
-        self.main_pressure_edge_weight = float(proj_cfg.get("main_pressure_edge_weight", 0.0))
-        self.main_profile_scale_floor = float(proj_cfg.get("main_profile_scale_floor", 1.0))
         self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 1.0))
-        self.profile_penalty_weight = float(proj_cfg.get("profile_penalty_weight", 1.0))
-        legacy_tR = proj_cfg.get("reg_tR_weight", None)
-        legacy_tZ = proj_cfg.get("reg_tZ_weight", None)
-        if (legacy_tR is not None) or (legacy_tZ is not None):
-            vals = [float(v) for v in [legacy_tR, legacy_tZ] if v is not None]
-            legacy_theta = float(np.mean(vals)) if len(vals) > 0 else 1.0
-        else:
-            legacy_theta = 1.0
-        self.reg_theta_weight = float(proj_cfg.get("reg_theta_weight", legacy_theta))
-        self.reg_lambda_weight = float(proj_cfg.get("reg_lambda_weight", proj_cfg.get("reg_lam_weight", 1.0)))
-        self.reg_beta_M = float(proj_cfg.get("reg_beta_M", 1.0))
-        self.reg_beta_N = float(proj_cfg.get("reg_beta_N", 1.0))
-        self.reg_beta_L = float(proj_cfg.get("reg_beta_L", 1.0))
-        self.reg_gamma_M = float(proj_cfg.get("reg_gamma_M", 1.0))
-        self.reg_gamma_N = float(proj_cfg.get("reg_gamma_N", 1.0))
-        self.reg_gamma_L = float(proj_cfg.get("reg_gamma_L", 1.0))
+        self.alpha_1d = float(proj_cfg.get("alpha_1d", proj_cfg.get("reg_theta_weight", 1.0)))
+        self.alpha_tR = float(proj_cfg.get("alpha_tR", proj_cfg.get("reg_tR_weight", self.alpha_1d)))
+        self.alpha_tZ = float(proj_cfg.get("alpha_tZ", proj_cfg.get("reg_tZ_weight", self.alpha_1d)))
+        self.alpha_lam = float(proj_cfg.get("alpha_lam", proj_cfg.get("reg_lam_weight", proj_cfg.get("reg_lambda_weight", 1.0))))
+        self.theta_l_power = float(proj_cfg.get("theta_l_power", 4.0))
+        self.lam_m_power = float(proj_cfg.get("lam_m_power", 2.0))
+        self.lam_n_power = float(proj_cfg.get("lam_n_power", 2.0))
+        self.lam_l_power = float(proj_cfg.get("lam_l_power", 4.0))
         base_main_phys_weight = self.main_phys_weight
-        base_profile_penalty_weight = self.profile_penalty_weight
-        base_reg_theta_weight = self.reg_theta_weight
-        base_reg_lambda_weight = self.reg_lambda_weight
+        base_alpha_1d = self.alpha_1d
+        base_alpha_tR = self.alpha_tR
+        base_alpha_tZ = self.alpha_tZ
+        base_alpha_lam = self.alpha_lam
         use_block_rms_normalization = bool(proj_cfg.get("use_block_rms_normalization", True))
-        block_rms_floor = float(proj_cfg.get("block_rms_floor", 1e-8))
+        block_rms_floor = float(proj_cfg.get("block_rms_floor", 1e-2))
+        block_rms_ceil = float(proj_cfg.get("block_rms_ceil", 1e2))
+        block_rms_disable_threshold = float(proj_cfg.get("block_rms_disable_threshold", 1e-6))
         block_rms_probe_epsilon = float(proj_cfg.get("block_rms_probe_epsilon", 1e-3))
         block_rms_probe_seed = proj_cfg.get("block_rms_probe_seed", None)
+        variable_scale_probe_epsilon = float(proj_cfg.get("variable_scale_probe_epsilon", 1e-3))
+        variable_scale_probe_seed = proj_cfg.get("variable_scale_probe_seed", block_rms_probe_seed)
+        variable_scale_floor = float(proj_cfg.get("variable_scale_floor", 1e-3))
+        variable_scale_ceil = float(proj_cfg.get("variable_scale_ceil", 1e2))
         phys_weight_start_factor = float(proj_cfg.get("phys_weight_start_factor", 0.6))
-        profile_weight_start_factor = float(proj_cfg.get("profile_weight_start_factor", 1.0))
-        reg_theta_weight_start_factor = float(proj_cfg.get("reg_theta_weight_start_factor", 1.5))
-        reg_lambda_weight_start_factor = float(proj_cfg.get("reg_lambda_weight_start_factor", 1.5))
+        alpha_1d_start_factor = float(proj_cfg.get("alpha_1d_start_factor", 1.2))
+        alpha_tR_start_factor = float(proj_cfg.get("alpha_tR_start_factor", 1.2))
+        alpha_tZ_start_factor = float(proj_cfg.get("alpha_tZ_start_factor", 1.2))
+        alpha_lam_start_factor = float(proj_cfg.get("alpha_lam_start_factor", 1.5))
         # 兼容旧字段，便于外部仍读取
-        self.reg_tR_weight = self.reg_theta_weight
-        self.reg_tZ_weight = self.reg_theta_weight
-        self.reg_lam_weight = self.reg_lambda_weight
-        use_prox = bool(proj_cfg.get("enabled", False))
-        outer_loops = int(proj_cfg.get("outer_loops", 1 if not use_prox else 3))
+        self.reg_theta_weight = self.alpha_1d
+        self.reg_lambda_weight = self.alpha_lam
+        self.reg_tR_weight = self.alpha_tR
+        self.reg_tZ_weight = self.alpha_tZ
+        self.reg_lam_weight = self.alpha_lam
+        outer_loops = int(proj_cfg.get("outer_loops", 1))
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
         use_exact_jacobian = bool(proj_cfg.get("use_exact_jacobian", True))
         use_weight_continuation = bool(proj_cfg.get("use_weight_continuation", outer_loops > 1))
@@ -1327,11 +1133,6 @@ class VEQ3D_Solver:
         print(f"    >>> 雅可比模式: {'JAX 精确雅可比' if use_exact_jacobian else 'SciPy 2-point 数值雅可比'}")
         eval_hist = []
         self._last_eval_history = eval_hist
-        if self.linear_constraint_A is None:
-            print("    >>> 线性约束投影: 未配置线性 A x = b，跳过 Layer-1")
-        else:
-            print(f"    >>> 线性约束投影: 启用 Layer-1 (约束数={self.linear_constraint_A.shape[0]})")
-
         active_idx = np.flatnonzero(~self.core_fixed_mask)
         n_active = int(active_idx.size)
         active_idx_jnp = jnp.array(active_idx, dtype=jnp.int32)
@@ -1344,13 +1145,19 @@ class VEQ3D_Solver:
             return x_full
 
         iter_counter = 0
+        active_var_scales_cb = np.ones(n_active, dtype=float) if n_active > 0 else np.array([], dtype=float)
 
         def iter_callback(intermediate_result):
             nonlocal iter_counter
             iter_counter += 1
             if (iter_counter % 10) != 0:
                 return
-            x_iter = merge_active_to_full(np.array(intermediate_result.x, dtype=float))
+            x_iter_active_scaled = np.array(intermediate_result.x, dtype=float)
+            if n_active > 0 and active_var_scales_cb.size == x_iter_active_scaled.size:
+                x_iter_active_phys = x_iter_active_scaled * active_var_scales_cb
+            else:
+                x_iter_active_phys = x_iter_active_scaled
+            x_iter = merge_active_to_full(x_iter_active_phys)
             en_iter = self.metric_global_energy_terms(x_iter, pressure_scale_factor)
             print(
                 f"    [Iter {iter_counter:03d}] "
@@ -1367,8 +1174,15 @@ class VEQ3D_Solver:
                     f"权重系数={item['effective_weight']:.6e}, "
                     f"维度={item['size']}"
                 )
+            fb_rel_iter = self.metric_force_balance_rel(x_iter, pressure_scale_factor)
+            divb_rel_iter = self.metric_divB_rel(x_iter, pressure_scale_factor)
+            print(
+                "    迭代监控: "
+                f"force_balance_rel={fb_rel_iter:.6e}, "
+                f"divB_rel={divb_rel_iter:.6e}"
+            )
         
-        x_curr = self._apply_fixed_core(self._linear_constraint_project(np.array(x0, dtype=float)))
+        x_curr = self._apply_fixed_core(np.array(x0, dtype=float))
         total_nfev = 0
         res = None
         jax_res_fn = None
@@ -1377,24 +1191,54 @@ class VEQ3D_Solver:
             if use_weight_continuation and outer_loops > 1:
                 t = float(outer_idx) / float(max(outer_loops - 1, 1))
                 phys_factor = phys_weight_start_factor + (1.0 - phys_weight_start_factor) * t
-                profile_factor = profile_weight_start_factor + (1.0 - profile_weight_start_factor) * t
-                reg_theta_factor = reg_theta_weight_start_factor + (1.0 - reg_theta_weight_start_factor) * t
-                reg_lambda_factor = reg_lambda_weight_start_factor + (1.0 - reg_lambda_weight_start_factor) * t
+                alpha_1d_factor = alpha_1d_start_factor + (1.0 - alpha_1d_start_factor) * t
+                alpha_tR_factor = alpha_tR_start_factor + (1.0 - alpha_tR_start_factor) * t
+                alpha_tZ_factor = alpha_tZ_start_factor + (1.0 - alpha_tZ_start_factor) * t
+                alpha_lam_factor = alpha_lam_start_factor + (1.0 - alpha_lam_start_factor) * t
             else:
-                phys_factor = profile_factor = reg_theta_factor = reg_lambda_factor = 1.0
+                phys_factor = 1.0
+                alpha_1d_factor = alpha_tR_factor = alpha_tZ_factor = alpha_lam_factor = 1.0
             self.main_phys_weight = base_main_phys_weight * phys_factor
-            self.profile_penalty_weight = base_profile_penalty_weight * profile_factor
-            self.reg_theta_weight = base_reg_theta_weight * reg_theta_factor
-            self.reg_lambda_weight = base_reg_lambda_weight * reg_lambda_factor
-            self.reg_tR_weight = self.reg_theta_weight
-            self.reg_tZ_weight = self.reg_theta_weight
-            self.reg_lam_weight = self.reg_lambda_weight
+            self.alpha_1d = base_alpha_1d * alpha_1d_factor
+            self.alpha_tR = base_alpha_tR * alpha_tR_factor
+            self.alpha_tZ = base_alpha_tZ * alpha_tZ_factor
+            self.alpha_lam = base_alpha_lam * alpha_lam_factor
+            # 兼容旧字段
+            self.reg_theta_weight = self.alpha_1d
+            self.reg_lambda_weight = self.alpha_lam
+            self.reg_tR_weight = self.alpha_tR
+            self.reg_tZ_weight = self.alpha_tZ
+            self.reg_lam_weight = self.alpha_lam
 
-        def _build_fun_and_jac(jax_res_fn_local):
+        def _estimate_variable_scales(x_ref):
+            scales = self._default_variable_scales()
+            if n_active <= 0 or variable_scale_probe_epsilon <= 0.0:
+                return np.clip(scales, variable_scale_floor, variable_scale_ceil)
+            x_probe = np.array(x_ref, dtype=float).copy()
+            if variable_scale_probe_seed is None:
+                noise = np.random.randn(n_active)
+            else:
+                noise = np.random.default_rng(int(variable_scale_probe_seed)).standard_normal(n_active)
+            x_probe[active_idx] = x_probe[active_idx] + variable_scale_probe_epsilon * noise
+            x_probe = self._apply_fixed_core(x_probe)
+            for name, offset, width in self._iter_core_blocks():
+                if width <= 0:
+                    continue
+                seg = x_probe[offset:offset + self.L_rad * width]
+                rms = np.sqrt(np.mean(seg**2)) if seg.size > 0 else 1.0
+                if not np.isfinite(rms) or rms <= 0.0:
+                    continue
+                scales[offset:offset + self.L_rad * width] = rms
+            return np.clip(scales, variable_scale_floor, variable_scale_ceil)
+
+        def _build_fun_and_jac(jax_res_fn_local, active_var_scales):
+            active_var_scales_jnp = jnp.array(active_var_scales, dtype=float)
+
             @jax.jit
-            def fun_active_wrapped(x_active_arr):
+            def fun_active_wrapped(x_active_scaled_arr):
                 x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
-                x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+                x_active_phys = x_active_scaled_arr * active_var_scales_jnp
+                x_full = x_full.at[active_idx_jnp].set(x_active_phys)
                 return jax_res_fn_local(x_full, apply_scaling=True)
 
             @jax.jit
@@ -1411,11 +1255,14 @@ class VEQ3D_Solver:
 
             return fun_logged, jac_logged
 
+        self.var_scales = _estimate_variable_scales(x_curr)
+        print(
+            "    >>> [VariableScaleInit] "
+            f"min={np.min(self.var_scales):.3e}, median={np.median(self.var_scales):.3e}, max={np.max(self.var_scales):.3e}"
+        )
+
         if use_block_rms_normalization:
             self.block_rms_phys = 1.0
-            self.block_rms_profile = 1.0
-            self.block_rms_reg_theta = 1.0
-            self.block_rms_reg_lam = 1.0
             _set_outer_block_weights(0)
             jax_res_fn_for_init = self._build_jax_residual_fn(pressure_scale_factor)
             res_init = np.array(
@@ -1428,57 +1275,24 @@ class VEQ3D_Solver:
                 dtype=float,
             )
             phys_len = self.num_core_params
-            profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
             reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
             reg_lam_len = self.L_rad * self.len_lam
 
             idx = 0
             block_phys = res_init[idx:idx + phys_len]
-            idx += phys_len
-            block_profile = res_init[idx:idx + profile_len]
-            idx += profile_len
-            block_reg_theta = res_init[idx:idx + reg_theta_len]
-            idx += reg_theta_len
-            block_reg_lam = res_init[idx:idx + reg_lam_len]
-
-            # 对正则块使用“参数初始扰动 probe”估计 RMS，避免 x0=0 导致正则 RMS 退化为 floor
-            x_probe = np.array(x_curr, dtype=float).copy()
-            if n_active > 0 and block_rms_probe_epsilon > 0.0:
-                if block_rms_probe_seed is None:
-                    noise = np.random.randn(n_active)
-                else:
-                    noise = np.random.default_rng(int(block_rms_probe_seed)).standard_normal(n_active)
-                x_probe[active_idx] = x_probe[active_idx] + block_rms_probe_epsilon * noise
-                x_probe = self._apply_fixed_core(self._linear_constraint_project(x_probe))
-                res_probe = np.array(
-                    jax_res_fn_for_init(
-                        jnp.array(x_probe),
-                        apply_scaling=True,
-                        apply_group_weights=False,
-                        apply_block_normalization=False,
-                    ),
-                    dtype=float,
-                )
-                idx_probe = phys_len + profile_len
-                block_reg_theta = res_probe[idx_probe:idx_probe + reg_theta_len]
-                idx_probe += reg_theta_len
-                block_reg_lam = res_probe[idx_probe:idx_probe + reg_lam_len]
 
             def _rms(v):
                 if v.size == 0:
                     return 1.0
-                return float(max(np.linalg.norm(v) / np.sqrt(v.size), block_rms_floor))
+                raw = float(np.linalg.norm(v) / np.sqrt(v.size))
+                if (not np.isfinite(raw)) or (raw < block_rms_disable_threshold):
+                    return 1.0
+                return float(np.clip(raw, block_rms_floor, block_rms_ceil))
 
             self.block_rms_phys = _rms(block_phys)
-            self.block_rms_profile = _rms(block_profile)
-            self.block_rms_reg_theta = _rms(block_reg_theta)
-            self.block_rms_reg_lam = _rms(block_reg_lam)
             print(
                 "    >>> [BlockRMSInit] "
-                f"phys={self.block_rms_phys:.3e}, "
-                f"profile={self.block_rms_profile:.3e}, "
-                f"reg_theta={self.block_rms_reg_theta:.3e}, "
-                f"reg_lambda={self.block_rms_reg_lam:.3e}"
+                f"phys={self.block_rms_phys:.3e}"
             )
             if n_active > 0 and block_rms_probe_epsilon > 0.0:
                 print(
@@ -1488,9 +1302,6 @@ class VEQ3D_Solver:
                 )
         else:
             self.block_rms_phys = 1.0
-            self.block_rms_profile = 1.0
-            self.block_rms_reg_theta = 1.0
-            self.block_rms_reg_lam = 1.0
             print("    >>> [BlockRMSInit] 已禁用块归一化，沿用原始尺度。")
 
         if n_active == 0:
@@ -1506,17 +1317,20 @@ class VEQ3D_Solver:
             this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
             _set_outer_block_weights(outer)
             jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
-            fun_logged, jac_logged = _build_fun_and_jac(jax_res_fn)
+            active_var_scales = self.var_scales[active_idx] if n_active > 0 else np.array([], dtype=float)
+            active_var_scales_cb = active_var_scales
+            fun_logged, jac_logged = _build_fun_and_jac(jax_res_fn, active_var_scales)
             print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
             print(
                 "    >>> [WeightSchedule] "
                 f"main_phys={self.main_phys_weight:.3e}, "
-                f"profile={self.profile_penalty_weight:.3e}, "
-                f"reg_theta={self.reg_theta_weight:.3e}, "
-                f"reg_lambda={self.reg_lambda_weight:.3e}"
+                f"alpha_1d={self.alpha_1d:.3e}, "
+                f"alpha_tR={self.alpha_tR:.3e}, "
+                f"alpha_tZ={self.alpha_tZ:.3e}, "
+                f"alpha_lam={self.alpha_lam:.3e}"
             )
             try:
-                x_active0 = x_curr[active_idx]
+                x_active0 = x_curr[active_idx] / active_var_scales
                 res = least_squares(
                     fun_logged,
                     x_active0,
@@ -1551,23 +1365,10 @@ class VEQ3D_Solver:
                     )
                 else:
                     raise
-            x_curr = merge_active_to_full(np.asarray(res.x, dtype=float))
+            x_curr = merge_active_to_full(np.asarray(res.x, dtype=float) * active_var_scales)
             total_nfev += int(res.nfev)
 
-            x_curr = self._apply_fixed_core(self._linear_constraint_project(x_curr))
-
-            if use_prox:
-                x_proj, pinfo = self._apply_proximal_projection(
-                    x_curr,
-                    pressure_scale_factor=pressure_scale_factor,
-                    projection_cfg=proj_cfg,
-                )
-                x_curr = self._apply_fixed_core(self._linear_constraint_project(x_proj))
-                if pinfo.get("applied", False):
-                    print(
-                        "    >>> [ProximalProjection] "
-                        f"nfev={pinfo['nfev']}, ||r||: {pinfo['before_norm']:.3e} -> {pinfo['after_norm']:.3e}"
-                    )
+            x_curr = self._apply_fixed_core(x_curr)
 
         end_time = time.time()
         if res is None:
@@ -2039,7 +1840,7 @@ class VEQ3D_Solver:
         }
 
     def metric_penalty_breakdown(self, x_core, pressure_scale_factor=1.0):
-        """将惩罚项拆分为 profile/reg_theta(非Lambda)/reg_lambda 三类（禁用 scaling）。"""
+        """将惩罚项拆分为 reg_theta(非Lambda)/reg_lambda 两类（禁用 scaling）。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         x_eff = self._apply_fixed_core(x_core)
         res_all = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
@@ -2047,25 +1848,22 @@ class VEQ3D_Solver:
         res_phys = res_all[:phys_len]
         res_pen_all = res_all[phys_len:]
 
-        profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
         reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
         reg_lam_len = self.L_rad * self.len_lam
 
         idx = 0
-        res_profile = res_pen_all[idx:idx + profile_len]
-        idx += profile_len
         res_reg_theta = res_pen_all[idx:idx + reg_theta_len]
         idx += reg_theta_len
         res_reg_lam = res_pen_all[idx:idx + reg_lam_len]
 
-        res_pen = np.concatenate([res_profile, res_reg_theta, res_reg_lam]) if (
-            (res_profile.size + res_reg_theta.size + res_reg_lam.size) > 0
+        res_pen = np.concatenate([res_reg_theta, res_reg_lam]) if (
+            (res_reg_theta.size + res_reg_lam.size) > 0
         ) else np.array([], dtype=float)
         norm_phys = float(np.linalg.norm(res_phys))
         norm_pen = float(np.linalg.norm(res_pen))
         return {
             "norm_phys_unscaled": norm_phys,
-            "norm_profile_penalty_unscaled": float(np.linalg.norm(res_profile)),
+            "norm_profile_penalty_unscaled": 0.0,
             "norm_reg_theta_unscaled": float(np.linalg.norm(res_reg_theta)),
             "norm_reg_lam_unscaled": float(np.linalg.norm(res_reg_lam)),
             "norm_penalty_unscaled": norm_pen,
@@ -2084,20 +1882,6 @@ class VEQ3D_Solver:
             "masking_factor": norm_unscaled / (norm_scaled + 1e-14),
         }
 
-    def metric_projection_disruption(self, x_core, projection_cfg=None, pressure_scale_factor=1.0):
-        """评估 proximal 投影对力平衡的扰动程度。"""
-        cfg = dict(projection_cfg or {})
-        if not cfg or not bool(cfg.get("enabled", False)):
-            return {"fb_before": 0.0, "fb_after": 0.0, "disruption_ratio": 1.0}
-        fb_before = self.metric_force_balance_rel(x_core, pressure_scale_factor)
-        x_proj, _ = self._apply_proximal_projection(x_core, pressure_scale_factor, cfg)
-        fb_after = self.metric_force_balance_rel(x_proj, pressure_scale_factor)
-        return {
-            "fb_before": float(fb_before),
-            "fb_after": float(fb_after),
-            "disruption_ratio": float(fb_after / (fb_before + 1e-14)),
-        }
-
     def metric_residual_group_breakdown(self, x_core, pressure_scale_factor=1.0):
         """按组分拆分残差，返回未加权 raw 与加权后 residual。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
@@ -2112,13 +1896,11 @@ class VEQ3D_Solver:
         )
 
         phys_len = self.num_core_params
-        profile_len = (self.Nr if self.main_dp_weight > 0.0 else 0) + (1 if self.main_pressure_edge_weight > 0.0 else 0)
         reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
         reg_lam_len = self.L_rad * self.len_lam
 
         groups_meta = [
             ("main_phys", "主物理残差", phys_len),
-            ("profile_penalty", "剖面约束惩罚", profile_len),
             ("reg_theta", "正则项 Theta(非Lambda)", reg_theta_len),
             ("reg_lam", "正则项 Lambda", reg_lam_len),
         ]
@@ -2243,8 +2025,6 @@ class VEQ3D_Solver:
         ppr = self.metric_penalty_ratio(x_core, pressure_scale_factor)
         pbd = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
         smf = self.metric_scaling_masking(x_core, pressure_scale_factor)
-        proj_cfg = projection_cfg if projection_cfg is not None else getattr(self, "_last_projection_cfg", None)
-        pdi = self.metric_projection_disruption(x_core, proj_cfg, pressure_scale_factor)
         block = self.metric_directional_spectral_blocking(x_core)
         conv = self.metric_resolution_convergence(x_core, pressure_scale_factor)
 
@@ -2281,7 +2061,6 @@ class VEQ3D_Solver:
         print(">>> 优化健康度与求解器诊断指标")
         ppr_flag = "PASS" if ppr["penalty_ratio"] < 0.1 else ("WARN" if ppr["penalty_ratio"] < 1.0 else "FAIL")
         smf_flag = "PASS" if smf["masking_factor"] < 1e2 else ("WARN" if smf["masking_factor"] < 1e4 else "FAIL")
-        pdi_flag = "PASS" if pdi["disruption_ratio"] < 1.2 else ("WARN" if pdi["disruption_ratio"] < 1.5 else "FAIL")
         rb_max = max(block["radial_blocking_R"], block["radial_blocking_Z"])
         ab_max = max(block["angular_blocking_R"], block["angular_blocking_Z"])
         rb_flag = "PASS" if rb_max < 1e-3 else ("WARN" if rb_max < 1e-2 else "FAIL")
@@ -2297,10 +2076,6 @@ class VEQ3D_Solver:
         print(
             f"    - scaling_masking_factor          : {smf['masking_factor']:.6e} "
             f"[{smf_flag}: 推荐 < 1e2]"
-        )
-        print(
-            f"    - projection_disruption_ratio     : {pdi['disruption_ratio']:.6e} "
-            f"[{pdi_flag}: 推荐 ~ 1]"
         )
         print(
             f"    - radial_spectral_blocking_max    : {rb_max:.6e} "
@@ -2419,20 +2194,14 @@ class VEQ3D_Solver:
         print("="*70)
         self.update_grid(c_Nr, c_Nt, c_Nz)
         proj_phase1 = {
-            "enabled": True,
             "outer_loops": 2,
             "lsq_chunk_nfev": 90,
-            "strength": 0.03,
-            "boundary_strength": 0.05,
-            "anchor_weight": 1e-2,
-            "dp_strength": 0.0,
-            "pressure_edge_strength": 0.0,
-            "pressure_axis_strength": 0.0,
-            "p_profile_strength": 0.0,
-            "main_dp_weight": 0.0,
-            "main_pressure_edge_weight": 0.0,
-            "prox_max_nfev": 6,
-            "prox_ftol": 1e-7,
+            "use_weight_continuation": True,
+            "alpha_1d": 1.0,
+            "alpha_tR": 1.0,
+            "alpha_tZ": 1.0,
+            "alpha_lam": 5.0,
+            "alpha_lam_start_factor": 1.5,
         }
         res_phase1 = self._run_optimization(
             x0,
@@ -2448,20 +2217,14 @@ class VEQ3D_Solver:
         print("="*70)
         self.update_grid(m_Nr, m_Nt, m_Nz)
         proj_phase2 = {
-            "enabled": True,
             "outer_loops": 3,
             "lsq_chunk_nfev": 110,
-            "strength": 0.08,
-            "boundary_strength": 0.12,
-            "anchor_weight": 5e-3,
-            "dp_strength": 0.35,
-            "pressure_edge_strength": 0.35,
-            "pressure_axis_strength": 0.0,
-            "p_profile_strength": 0.0,
-            "main_dp_weight": 0.15,
-            "main_pressure_edge_weight": 0.05,
-            "prox_max_nfev": 8,
-            "prox_ftol": 1e-8,
+            "use_weight_continuation": True,
+            "alpha_1d": 0.5,
+            "alpha_tR": 0.5,
+            "alpha_tZ": 0.5,
+            "alpha_lam": 3.0,
+            "alpha_lam_start_factor": 1.4,
         }
         res_phase2 = self._run_optimization(
             res_phase1.x,
@@ -2477,25 +2240,17 @@ class VEQ3D_Solver:
         print("="*70)
         self.update_grid(h_Nr, h_Nt, h_Nz)
         proj_phase3 = {
-            "enabled": False,
             "outer_loops": 2,
             "lsq_chunk_nfev": 800,
-            "strength": 0.05,
-            "boundary_strength": 0.1,
-            "anchor_weight": 5e-2,
-            "dp_strength": 0.1,
-            "pressure_edge_strength": 0.1,
-            "pressure_axis_strength": 0.0,
-            "p_profile_strength": 0.0,
-            "main_dp_weight": 0.5,
-            "main_pressure_edge_weight": 0.2,
             "main_phys_weight": 10.0,
-            "profile_penalty_weight": 0.1,
-            "reg_tR_weight": 0.1,
-            "reg_tZ_weight": 0.1,
-            "reg_lam_weight": 0.1,
-            "prox_max_nfev": 5,
-            "prox_ftol": 1e-6,
+            "use_weight_continuation": True,
+            "alpha_1d": 0.2,
+            "alpha_tR": 0.2,
+            "alpha_tZ": 0.2,
+            "alpha_lam": 1.0,
+            "alpha_tR_start_factor": 1.2,
+            "alpha_tZ_start_factor": 1.2,
+            "alpha_lam_start_factor": 1.3,
         }
         res_fine = self._run_optimization(
             res_phase2.x,
@@ -2519,8 +2274,6 @@ class VEQ3D_Solver:
         pilot.L_rad = 3
         pilot._setup_modes()
         pilot.p_edge = None
-        pilot.linear_constraint_A = None
-        pilot.linear_constraint_b = None
         pilot._reset_core_freeze_state()
 
         pilot.N_fp = self.N_fp
@@ -2716,10 +2469,10 @@ class VEQ3D_Solver:
         desc_data = None
         unique_zetas = None
         zeta_match_tol = 0.1
-        if os.path.exists("RZ_data.txt"):
+        if os.path.exists("p0.txt"):
             try:
                 t0 = time.time()
-                desc_data = np.loadtxt("RZ_data.txt", delimiter=',', skiprows=1)
+                desc_data = np.loadtxt("p0.txt", delimiter=',', skiprows=1)
                 t1 = time.time()
                 # 统一将第三列角度转换为求解器内部 zeta
                 desc_data[:, 2] = self._desc_phi_to_solver_zeta(desc_data[:, 2])
@@ -2729,7 +2482,7 @@ class VEQ3D_Solver:
                     zeta_step = np.min(np.diff(unique_zetas))
                     # 自适应阈值：至少覆盖半个离散步长，避免 zeta=pi 这类临界漏匹配
                     zeta_match_tol = max(0.1, 0.55 * zeta_step)
-                print("    >>> 成功加载 DESC 对比数据 RZ_data.txt")
+                print("    >>> 成功加载 DESC 对比数据 p0.txt")
                 print("    >>> 已应用角度统一转换: zeta = N_fp * phi (mod 2pi)")
                 print(f"    >>> DESC 数据读取耗时: {t1 - t0:.3f} s | 角度转换耗时: {t2 - t1:.3f} s")
             except Exception as e:
