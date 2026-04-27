@@ -3,7 +3,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 import matplotlib.pyplot as plt
 import time
 from types import SimpleNamespace
@@ -13,7 +13,7 @@ from typing import Callable, Optional, Tuple, Dict, Any
 # 径向坐标 ρ（与 DESC / PEST 类 flux 坐标一致）
 #   ψ_N := Ψ/Ψ_a  归一化环向磁通（磁轴 ψ_N=0，最外闭合面 ψ_N=1）
 #   ρ := √ψ_N      本文件中所有 ρ、RHO、径向谱变量均基于此定义，故 ψ_N = ρ²
-#   Ψ(ρ) = Ψ_a·ρ²（取轴上 Ψ=0），dΨ/dρ = 2 Ψ_a ρ，与 _get_profiles 的 Phip 一致
+#   Ψ(ρ) = Ψ_a·ρ²（取轴上 Ψ=0）；Φ'_T = 2Ψ_a ρ，Ψ'_P = Φ'_T/q，见 _get_profiles
 # 径向 Chebyshev 节点映射 x = 2ρ²−1 = 2ψ_N−1，即在 ψ_N 上谱离散。
 # ---------------------------------------------------------------------------
 
@@ -154,49 +154,41 @@ class VEQ3D_Solver:
         # =========================================================
         # [自由度扩容] 提升表达能力以包容 3D 边界调制
         # =========================================================
-        self.M_pol = 2 
+        self.M_pol = 3 
         self.N_tor = 2
-        self.L_rad = 4
+        self.L_rad = 8
         # =========================================================
         
         self.N_fp = 19
         # Ψ_a：最外闭合面内总环向磁通（与 ψ_N=Ψ/Ψ_a、ρ=√ψ_N 配套；单位与 Phip=dΨ/dρ 一致）
         self.Phi_a = 1.0
-        self.mu_0 = 4 * np.pi * 1e-7
+        self.Phi_a_physical = float(self.Phi_a)
+        self.mu_0_physical = 4 * np.pi * 1e-7
+        self.mu_0 = self.mu_0_physical
+        # 无量纲参考量（边界拟合后更新）
+        self.L0 = 1.0
+        self.a0 = 1.0
+        self.B0 = 1.0
+        self.P_ref = 1.0
+        self.flux_ref = 1.0
+        self.current_ref = 1.0
+        self.energy_ref = 1.0
         
-        self.target_Nr = 24
-        self.target_Nt = 24
-        self.target_Nz = 16
+        self.target_Nr = 32
+        self.target_Nt = 20
+        self.target_Nz = 14
         
         self.p_edge = None  
         # det 手性方向（+1/-1）：用于兼容输入 LCFS 与 RZ 参数化方向差异
         self.det_chirality = 1.0
-        # 正则项总开关缩放，避免其在物理残差前喧宾夺主
-        self.regularization_scale = 0.5
-        # 各残差组分总权重（可在 projection_cfg 中按 phase 覆盖）
+        # 主物理残差权重（可在 projection_cfg 中按 outer 延续）
         self.main_phys_weight = 1.0
-        self.alpha_1d = 1.0
-        self.alpha_tR = 1.0
-        self.alpha_tZ = 1.0
-        self.alpha_lam = 1.0
-        # 谱正则权重指数（默认：tR/tZ 仅 L^4；Lambda 采用 m^2*n^2*l^4）
-        self.theta_l_power = 4.0
-        self.lam_m_power = 2.0
-        self.lam_n_power = 2.0
-        self.lam_l_power = 4.0
-        # 各残差块按初值 RMS 归一化（避免量纲/维度混杂）
-        self.block_rms_phys = 1.0
-        # 兼容旧命名
-        self.reg_theta_weight = 1.0
-        self.reg_lambda_weight = 1.0
-        self.reg_tR_weight = 1.0
-        self.reg_tZ_weight = 1.0
-        self.reg_lam_weight = 1.0
         
         self._setup_modes()
         
         self.update_grid(self.target_Nr, self.target_Nt, self.target_Nz)
         self.fit_boundary()  
+        self._apply_nondim_normalization_from_fitted_boundary()
         self._initialize_scaling()
         self._reset_core_freeze_state()
 
@@ -204,29 +196,100 @@ class VEQ3D_Solver:
         self.core_fixed_mask = np.zeros(self.num_core_params, dtype=bool)
         self.core_fixed_values = np.zeros(self.num_core_params, dtype=float)
 
+    def _slice_freeze_to_L(self, mask_full, vals_full, L_full, L_new):
+        """从 L_full 的冻结表截取各模态块的前 L_new 个径向 Chebyshev 行。"""
+        L_new = int(max(1, L_new))
+        L_full = int(max(1, L_full))
+        parts_m, parts_v = [], []
+        for _name, off, width in self._iter_core_blocks_static_L(L_full):
+            if width <= 0:
+                continue
+            nm = L_full * width
+            bm = np.asarray(mask_full[off:off + nm], dtype=bool).reshape(L_full, width)
+            bv = np.asarray(vals_full[off:off + nm], dtype=float).reshape(L_full, width)
+            parts_m.append(bm[:L_new, :].ravel())
+            parts_v.append(bv[:L_new, :].ravel())
+        return (
+            np.concatenate(parts_m) if parts_m else np.array([], dtype=bool),
+            np.concatenate(parts_v) if parts_v else np.array([], dtype=float),
+        )
+
+    def _core_x_to_L(self, x_core, L_from: int, L_to: int):
+        """在径向阶 L_from 与 L_to 之间重打包核心参数（等宽模态块）。"""
+        L_from, L_to = int(L_from), int(L_to)
+        x = np.asarray(x_core, dtype=float).ravel()
+        if L_from == L_to:
+            return x.copy()
+        out_parts = []
+        off = 0
+        for _name, _off_from, width in self._iter_core_blocks_static_L(L_from):
+            if width <= 0:
+                continue
+            nb = L_from * width
+            block = x[off:off + nb].reshape(L_from, width)
+            off += nb
+            if L_to > L_from:
+                nblock = np.zeros((L_to, width), dtype=float)
+                nblock[:L_from, :] = block
+            else:
+                nblock = block[:L_to, :].copy()
+            out_parts.append(nblock.ravel())
+        return np.concatenate(out_parts) if out_parts else np.array([], dtype=float)
+
+    def _set_spectral_L(self, L_new, freeze_mask_full, freeze_vals_full, L_freeze_ref: int):
+        """设径向谱阶 L_rad 并自洽 modes / 冻结(截断) / 变量尺度。"""
+        self.L_rad = int(L_new)
+        self._setup_modes()
+        m, v = self._slice_freeze_to_L(
+            np.asarray(freeze_mask_full, dtype=bool),
+            np.asarray(freeze_vals_full, dtype=float),
+            int(L_freeze_ref),
+            self.L_rad,
+        )
+        self.core_fixed_mask = m
+        self.core_fixed_values = v
+        self._initialize_scaling()
+
     def _apply_fixed_core(self, x_core):
         x = np.asarray(x_core, dtype=float).copy()
         if np.any(self.core_fixed_mask):
             x[self.core_fixed_mask] = self.core_fixed_values[self.core_fixed_mask]
         return x
 
-    def _iter_core_blocks(self):
-        offset = 0
-        block_specs = [
-            ("c0R", self.len_1d),
-            ("c0Z", self.len_1d),
-            ("h", self.len_1d),
-            ("v", self.len_1d),
-            ("k", self.len_1d),
-            ("a", self.len_1d),
-            ("tR", self.len_2d),
-            ("tZ", self.len_2d),
-            ("lam", self.len_lam),
+    @staticmethod
+    def _core_block_widths_for_modes(len_1d, len_2d, len_lam):
+        return [
+            ("c0R", len_1d),
+            ("c0Z", len_1d),
+            ("h", len_1d),
+            ("v", len_1d),
+            ("k", len_1d),
+            ("a", len_1d),
+            ("tR", len_2d),
+            ("tZ", len_2d),
+            ("lam", len_lam),
         ]
-        for name, width in block_specs:
-            size = self.L_rad * width
-            yield name, offset, width
-            offset += size
+
+    def _iter_core_blocks(self):
+        off = 0
+        for name, w in self._core_block_widths_for_modes(
+            self.len_1d, self.len_2d, self.len_lam
+        ):
+            if w <= 0:
+                continue
+            yield name, off, w
+            off += self.L_rad * w
+
+    def _iter_core_blocks_static_L(self, L_row: int):
+        off = 0
+        L_row = int(L_row)
+        for name, w in self._core_block_widths_for_modes(
+            self.len_1d, self.len_2d, self.len_lam
+        ):
+            if w <= 0:
+                continue
+            yield name, off, w
+            off += L_row * w
 
     def _one_d_mode_map(self):
         out = {(0, "0"): 0}
@@ -471,6 +534,8 @@ class VEQ3D_Solver:
         self.Nr = Nr
         self.Nt_grid = Nt_grid
         self.Nz_grid = Nz_grid
+        # 配点法主物理残差: F_rho 与 F_beta 在 Nr×Nt×Nz 上展平后拼接
+        self.num_phys_residual = 2 * int(self.Nr) * int(self.Nt_grid) * int(self.Nz_grid)
         
         rho_nodes, self.rho_weights = self._get_chebyshev_nodes_and_weights(self.Nr)
         # ρ = √ψ_N ∈ (0,1]：Chebyshev 原点在 x∈[-1,1]，映射到 ρ；最外面对应 ψ_N=1、ρ=1
@@ -521,17 +586,12 @@ class VEQ3D_Solver:
 
         if self.len_lam > 0:
             lam_m_vals = np.array([m for m, n in self.lambda_modes])
-            self.rho_m_lam = self.rho[None, :] ** lam_m_vals[:, None]
+            # m=0 时 rho^0 在轴上为常数，d_zeta(lambda) 不消失导致 B^theta ~ 1/sqrt(g)~1/rho；强制 m=0 用 rho^2
+            lam_m_eff = np.where(lam_m_vals == 0, 2.0, lam_m_vals)
+            self.rho_m_lam = self.rho[None, :] ** lam_m_eff[:, None]
         else:
             self.rho_m_lam = np.array([])
             
-        if self.len_2d > 0:
-            m_vals_2d = np.array([m for m, n, typ in self.modes_2d])
-            n_vals_2d = np.array([n for m, n, typ in self.modes_2d])
-            self.reg_weight_2d = np.sqrt(m_vals_2d**2 + n_vals_2d**2)
-        else:
-            self.reg_weight_2d = np.array([])
-
     def _setup_modes(self):
         self.len_1d = 1 + 2 * self.N_tor
         
@@ -665,25 +725,117 @@ class VEQ3D_Solver:
             scales[offset:offset + self.L_rad * width] = val
         return scales
 
+    def _edge_1d_eval_at_rho1(self, coeffs):
+        """在 rho=1 边界上评估 1D(zeta) 系数场。"""
+        return np.sum(coeffs[:, None] * self.basis_1d_val[:, 0, 0, :], axis=0)
+
+    def _compute_fitted_minor_radius(self):
+        """由拟合边界的 a(zeta) 估计特征小半径 a0。"""
+        _e_R0, _e_Z0, _e_c0R, _e_c0Z, _e_h, _e_v, _e_k, e_a, _e_tR, _e_tZ = self.unpack_edge()
+        a_edge = self._edge_1d_eval_at_rho1(e_a)
+        a0 = float(np.mean(np.abs(a_edge)))
+        return max(a0, 1e-14)
+
+    def _apply_nondim_normalization_from_fitted_boundary(self):
+        """
+        在边界拟合后执行无量纲化：
+          L0 = R0_fit, B0 = Phi_a / (pi * a0^2), mu0 -> 1.
+        内部求解使用无量纲变量；几何输出可再转换回物理量。
+        """
+        if self.p_edge is None:
+            raise RuntimeError("p_edge 尚未建立，无法执行无量纲化。")
+
+        p = np.asarray(self.p_edge, dtype=float).copy()
+        L0 = max(abs(float(p[0])), 1e-14)
+        a0 = self._compute_fitted_minor_radius()
+        phi_a_phys = float(getattr(self, "Phi_a_physical", self.Phi_a))
+        phi_a_abs = max(abs(phi_a_phys), 1e-14)
+        B0 = phi_a_abs / (np.pi * a0 * a0)
+        B0 = max(abs(B0), 1e-14)
+
+        idx = 2
+        c0R_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        c0Z_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        h_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        v_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        k_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        a_slice = slice(idx, idx + self.len_1d); idx += self.len_1d
+        tR_slice = slice(idx, idx + self.len_2d); idx += self.len_2d
+        tZ_slice = slice(idx, idx + self.len_2d); idx += self.len_2d
+        _ = (c0R_slice, c0Z_slice, h_slice, v_slice, k_slice, tR_slice, tZ_slice)
+
+        # 长度量归一化：R0/Z0 与 a(zeta) 系数；其余角度/无量纲形状系数保持不变。
+        p[0] /= L0
+        p[1] /= L0
+        p[a_slice] /= L0
+        self.p_edge = p
+
+        # 磁通与压力归一化
+        self.L0 = L0
+        self.a0 = a0
+        self.B0 = B0
+        self.flux_ref = B0 * L0 * L0
+        self.Phi_a = phi_a_phys / self.flux_ref
+        self.P_ref = (B0 * B0) / max(self.mu_0_physical, 1e-30)
+        self.current_ref = B0 / (max(self.mu_0_physical, 1e-30) * L0)
+        self.energy_ref = (B0 * B0 * L0**3) / max(self.mu_0_physical, 1e-30)
+        self.mu_0 = 1.0
+
+        print("    >>> 已执行无量纲化 (DESC/VMEC/CHEASE 风格):")
+        print(f"        L0 = R0_fit = {self.L0:.6e}")
+        print(f"        a0 = {self.a0:.6e}")
+        print(f"        B0 = Phi_a/(pi*a0^2) = {self.B0:.6e}")
+        print(f"        Phi_a* = {self.Phi_a:.6e}, mu_0* = {self.mu_0:.1f}")
+        self._print_nondim_consistency_check()
+
+    def _print_nondim_consistency_check(self):
+        """打印关键归一化量的一致性检查（便于人工核对）。"""
+        phi_from_geom = np.pi * (self.a0 / max(self.L0, 1e-14)) ** 2
+        phi_err = abs(abs(self.Phi_a) - phi_from_geom)
+        print("    >>> 归一化一致性检查:")
+        print(f"        Phi_a* (abs)            = {abs(self.Phi_a):.6e}")
+        print(f"        pi*(a0/L0)^2            = {phi_from_geom:.6e}")
+        print(f"        |diff|                  = {phi_err:.3e}")
+        print(f"        flux_ref = B0*L0^2      = {self.flux_ref:.6e}")
+        print(f"        P_ref = B0^2/mu0_phys   = {self.P_ref:.6e}")
+        print(f"        J_ref = B0/(mu0_physL0) = {self.current_ref:.6e}")
+        print(f"        E_ref = B0^2L0^3/mu0    = {self.energy_ref:.6e}")
+
     def compute_psi(self, rho):
         """极向磁通 ψ(ρ)，与 _get_profiles 中 psip=dψ/dρ 保持一致。"""
-        # 约定：phi(ρ) 为环向磁通，dphi/dρ = Phip = 2*Phi_a*ρ
-        #      psi(ρ) 为极向磁通，dpsi/dρ = psip = iota(ρ)*Phip
+        # 约定：phi(ρ) 为环向磁通，dphi/dρ = Φ'_T = 2*Phi_a*ρ
+        #      psi(ρ) 为极向磁通，dpsi/dρ = Ψ'_P = Φ'_T/q = iota(ρ)*Φ'_T
         # 这里 iota(ρ)=1+1.5ρ²，积分并取 psi(0)=0 得
         # psi(ρ)=Phi_a*(ρ²+0.75ρ⁴)
         return self.Phi_a * (rho**2 + 0.75 * rho**4)
 
+    def _q_profile_flux(self, rho):
+        """安全因子 q(ρ)；与 iota 剖面自洽，满足 Ψ'_P = Φ'_T/q = iota * Φ'_T（均为 O(ρ)）。"""
+        iota = 1.0 + 1.5 * rho**2
+        return 1.0 / iota
+
     def _get_profiles(self, rho, pressure_scale_factor):
-        """剖面输入：P(ρ), dP/dρ, dphi/dρ(Phip), dpsi/dρ(psip)。"""
-        # P_scale = 1.8e4
-        P_scale = 0
+        """剖面：P(ρ), dP/dρ, 环向/极向磁通导数 Φ'_T、Ψ'_P（旧名 Phip、psip）。
+
+        有量纲剖面 P_phys ~ (Pa 量级) * 形状因子，在参与 G_rho = dP - … 力平衡
+        之前，必须除以 P_ref = B0^2/μ0（见无量纲化），得到无量纲 P、∂P/∂ρ，
+        才能与已无量纲的 J、B 项同量级。此后残差中 F_ρ, F_β 不再除 P_ref。
+        """
+        P_scale = 1.8e4
+        # P_scale = 0
         # p 仅为 ψ_N 的函数：(ψ_N−1)² 在边界 ψ_N=1 处为零
         P = pressure_scale_factor * P_scale * (rho**2 - 1)**2
         dP_drho = pressure_scale_factor * P_scale * 4 * rho * (rho**2 - 1)
+        P_ref = max(float(getattr(self, "P_ref", 1.0)), 1e-30)
+        P = P / P_ref
+        dP_drho = dP_drho / P_ref
 
-        iota = 1.0 + 1.5 * rho**2
-        Phip = 2 * rho * self.Phi_a
-        psip = iota * Phip
+        # Φ'_T ∝ ρ；Ψ'_P = Φ'_T/q，分子与 det_phys∼ρ 同阶，避免 B^ζ 轴上 1/ρ 奇性
+        Phi_T_prime = 2 * rho * self.Phi_a
+        q_prof = self._q_profile_flux(rho)
+        Psi_P_prime = Phi_T_prime / q_prof
+        Phip = Phi_T_prime
+        psip = Psi_P_prime
         return P, dP_drho, Phip, psip
 
     def _radial_integrate_forward(self, y, y0=0.0):
@@ -812,83 +964,23 @@ class VEQ3D_Solver:
         D_matrix = jnp.array(self.D_matrix)
         
         fac_rad, dfac_rad = jnp.array(self.fac_rad), jnp.array(self.dfac_rad)
-        fac_lam_eval, fac_lam_proj = jnp.array(self.fac_lam_eval), jnp.array(self.fac_lam_proj)
+        fac_lam_eval = jnp.array(self.fac_lam_eval)
         rho_m_lam = jnp.array(self.rho_m_lam)
 
         basis_1d_val_slice, basis_1d_dz_slice = jnp.array(self.basis_1d_val[:, 0, 0, :]), jnp.array(self.basis_1d_dz[:, 0, 0, :])
         basis_2d_val, basis_2d_dr = jnp.array(self.basis_2d_val), jnp.array(self.basis_2d_dr)
         basis_2d_dth, basis_2d_dze = jnp.array(self.basis_2d_dth), jnp.array(self.basis_2d_dze)
         
-        basis_lam_tz, basis_lam_dth, basis_lam_dze = jnp.array(self.basis_lam_val[:, 0, :, :]), jnp.array(self.basis_lam_dth[:, 0, :, :]), jnp.array(self.basis_lam_dze[:, 0, :, :])
+        basis_lam_dth, basis_lam_dze = jnp.array(self.basis_lam_dth[:, 0, :, :]), jnp.array(self.basis_lam_dze[:, 0, :, :])
         
-        k_th, k_ze, weights_3d = jnp.array(self.k_th), jnp.array(self.k_ze), jnp.array(self.weights_3d)
-        res_scales, p_edge = jnp.array(self.res_scales), jnp.array(self.p_edge)
-        regularization_scale = float(self.regularization_scale)
+        k_th, k_ze = jnp.array(self.k_th), jnp.array(self.k_ze)
+        p_edge = jnp.array(self.p_edge)
         main_phys_weight = float(self.main_phys_weight)
-        alpha_1d = float(self.alpha_1d)
-        alpha_tR = float(self.alpha_tR)
-        alpha_tZ = float(self.alpha_tZ)
-        alpha_lam = float(self.alpha_lam)
-        theta_l_power = float(self.theta_l_power)
-        lam_m_power = float(self.lam_m_power)
-        lam_n_power = float(self.lam_n_power)
-        lam_l_power = float(self.lam_l_power)
-        block_rms_phys = float(max(getattr(self, "block_rms_phys", 1.0), 1e-14))
-        block_rms_profile = float(max(getattr(self, "block_rms_profile", 1.0), 1e-14))
         det_chirality = jnp.array(self.det_chirality)
         
-        L_rad, len_1d, len_2d, len_lam = self.L_rad, self.len_1d, self.len_2d, self.len_lam
-        N_fp, mu_0, dtheta, dzeta = self.N_fp, self.mu_0, self.dtheta, self.dzeta
-        core_fixed_mask_np = np.asarray(self.core_fixed_mask, dtype=bool)
-        if core_fixed_mask_np.size != self.num_core_params:
-            core_fixed_mask_np = np.zeros(self.num_core_params, dtype=bool)
-        core_active_flat = (~core_fixed_mask_np).astype(float)
-        active_idx_off = 0
-
-        def get_active_mask(width):
-            nonlocal active_idx_off
-            if width <= 0:
-                return jnp.zeros((L_rad, 0))
-            size = int(L_rad * width)
-            out = core_active_flat[active_idx_off:active_idx_off + size].reshape((L_rad, width))
-            active_idx_off += size
-            return jnp.array(out)
-
-        reg_active_c0R = get_active_mask(len_1d)
-        reg_active_c0Z = get_active_mask(len_1d)
-        reg_active_h = get_active_mask(len_1d)
-        reg_active_v = get_active_mask(len_1d)
-        reg_active_k = get_active_mask(len_1d)
-        reg_active_a = get_active_mask(len_1d)
-        reg_active_tR = get_active_mask(len_2d)
-        reg_active_tZ = get_active_mask(len_2d)
-        reg_active_lam = get_active_mask(len_lam)
-
-        # 1D 模态对应 m=0，n=(0,1,1,2,2,...)，用于统一 m/n/l 正则权重
-        n_vals_1d = np.zeros(len_1d, dtype=float)
-        for i in range(1, len_1d):
-            n_vals_1d[i] = (i + 1) // 2
-        m_vals_1d = np.zeros(len_1d, dtype=float)
-        m_vals_2d = np.array([abs(m) for m, _n, _typ in self.modes_2d], dtype=float) if len_2d > 0 else np.array([], dtype=float)
-        n_vals_2d = np.array([abs(n) for _m, n, _typ in self.modes_2d], dtype=float) if len_2d > 0 else np.array([], dtype=float)
-        m_vals_lam = np.array([abs(m) for m, _n in self.lambda_modes], dtype=float) if len_lam > 0 else np.array([], dtype=float)
-        n_vals_lam = np.array([abs(n) for _m, n in self.lambda_modes], dtype=float) if len_lam > 0 else np.array([], dtype=float)
-        l_vals = jnp.arange(L_rad, dtype=float)[:, None]
-
-        l_norm = l_vals / max(L_rad, 1)
-        theta_l_weight = jnp.power(jnp.maximum(l_norm, 0.0), theta_l_power)
-        theta_mode_weight_1d = jnp.broadcast_to(theta_l_weight, (L_rad, len_1d)) if len_1d > 0 else jnp.zeros((L_rad, 0))
-        theta_mode_weight_2d = jnp.broadcast_to(theta_l_weight, (L_rad, len_2d)) if len_2d > 0 else jnp.zeros((L_rad, 0))
-        if len_lam > 0:
-            m_norm_lam = jnp.array(m_vals_lam)[None, :] / max(self.M_pol + 1, 1)
-            n_norm_lam = jnp.array(n_vals_lam)[None, :] / max(self.N_tor, 1)
-            lambda_mode_weight = (
-                jnp.power(jnp.maximum(m_norm_lam, 0.0), lam_m_power)
-                * jnp.power(jnp.maximum(n_norm_lam, 0.0), lam_n_power)
-                * jnp.power(jnp.maximum(l_norm, 0.0), lam_l_power)
-            )
-        else:
-            lambda_mode_weight = jnp.zeros((L_rad, 0))
+        L_rad = self.L_rad
+        len_1d, len_2d, len_lam = self.len_1d, self.len_2d, self.len_lam
+        N_fp, mu_0 = self.N_fp, self.mu_0
             
         def jax_unpack_edge(p):
             idx = 2
@@ -903,7 +995,7 @@ class VEQ3D_Solver:
         def spectral_grad_th(f): return jnp.real(jnp.fft.ifft(1j * k_th * jnp.fft.fft(f, axis=1), axis=1))
         def spectral_grad_ze(f): return jnp.real(jnp.fft.ifft(1j * k_ze * jnp.fft.fft(f, axis=2), axis=2))
 
-        def jax_res_fn(x_core, apply_scaling=True, apply_group_weights=True, apply_block_normalization=True):
+        def jax_res_fn(x_core, apply_scaling=True, apply_group_weights=True):
             e_R0, e_Z0, e_c0R, e_c0Z, e_h, e_v, e_k, e_a, e_tR, e_tZ = jax_unpack_edge(p_edge)
             c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = jax_unpack_core(x_core)
 
@@ -920,11 +1012,14 @@ class VEQ3D_Solver:
                 if len_2d == 0: return 0.0, 0.0, 0.0, 0.0
                 core_contrib = jnp.dot(c_c.T, fac_rad)  
                 ce_eff = c_e[:, None] + core_contrib    
-                val = jnp.sum(ce_eff[:, :, None, None] * basis_2d_val, axis=0)
-                dth = jnp.sum(ce_eff[:, :, None, None] * basis_2d_dth, axis=0)
-                dz  = jnp.sum(ce_eff[:, :, None, None] * basis_2d_dze, axis=0)
+                val = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_val)
+                dth = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dth)
+                dz  = jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dze)
                 dr_contrib = jnp.dot(c_c.T, dfac_rad)   
-                dr = jnp.sum(dr_contrib[:, :, None, None] * basis_2d_val + ce_eff[:, :, None, None] * basis_2d_dr, axis=0)
+                dr = (
+                    jnp.einsum('mr,mrtz->rtz', dr_contrib, basis_2d_val)
+                    + jnp.einsum('mr,mrtz->rtz', ce_eff, basis_2d_dr)
+                )
                 return val, dr, dth, dz
 
             c0R, c0Rr, c0Rz = eval_1d(e_c0R, c_c0R)
@@ -972,6 +1067,7 @@ class VEQ3D_Solver:
             Bt_sup = (psip / N_fp - Lz) / (2 * jnp.pi * sqrt_g)
             Bz_sup = (Phip + Lt) / (2 * jnp.pi * sqrt_g)
 
+            # 反变 B^θ,B^ζ -> 协变 B_θ,B_ζ（度规下标）；旋度仅对协变分量做 θ/ζ 谱导数
             Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
             Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
             Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
@@ -979,158 +1075,66 @@ class VEQ3D_Solver:
             dBt_drho = jnp.tensordot(D_matrix, Bt_sub, axes=(1, 0))
             dBz_drho = jnp.tensordot(D_matrix, Bz_sub, axes=(1, 0))
 
-            Jz_sup = (dBt_drho - spectral_grad_th(Br_sub)) / sqrt_g
-            Jt_sup = (spectral_grad_ze(Br_sub) - dBz_drho) / sqrt_g
-            Jr_sup = (spectral_grad_th(Bz_sub) - spectral_grad_ze(Bt_sub)) / sqrt_g
+            # sqrt(g)*J^i 的分子（未除以 sqrt_g）；J^ρ = ∂_θ B_ζ - ∂_ζ B_θ 等，输入为协变 B
+            Jz_unscaled = dBt_drho - spectral_grad_th(Br_sub)
+            Jt_unscaled = spectral_grad_ze(Br_sub) - dBz_drho
+            Jr_unscaled = spectral_grad_th(Bz_sub) - spectral_grad_ze(Bt_sub)
+            Jz_sup = Jz_unscaled / sqrt_g
+            Jt_sup = Jt_unscaled / sqrt_g
+            Jr_sup = Jr_unscaled / sqrt_g
 
             Jr_phys = Jr_sup / mu_0
-            G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / mu_0
+            # 径向力平衡用 J^θ B_ζ - J^ζ B_θ（与协变 B 一致）
+            F_rho = dP - (Jt_unscaled * Bz_sub - Jz_unscaled * Bt_sub) / mu_0
+            F_beta = Jr_unscaled / mu_0
 
-            # =================================================================
-            # [物理闭环终极修复 1]：完全解析抵消 det_phys，消除磁轴除零奇点
-            # =================================================================
-            F_rho = G_rho
-            F_beta = (Jr_phys / (2 * jnp.pi)) * (Phip + Lt)
+            # Dirichlet 边界：平方 taper 压低 ρ→1 处 PDE 残差对梯度的绑架
+            colloc_weight = (1.0 - RHO**2) ** 2
+            F_rho_norm = F_rho * colloc_weight
+            F_beta_norm = F_beta * colloc_weight
 
-            # 提取剔除了 det_phys 后的纯几何积分权重
-            metric_w = (R / N_fp) * weights_3d * (dtheta * dzeta)
-            
-            # 直接构造解析平滑的加权笛卡尔力分量
-            GR_w = (Zt * F_rho - Zr * F_beta) * metric_w
-            GZ_w = (-Rt * F_rho + Rr * F_beta) * metric_w
-            
-            term1 = GR_w * (a * RHO * jnp.sin(thR))
-            term2 = GZ_w * (-a * k * RHO * jnp.cos(thZ))
-            term3 = GR_w * a
-            term4 = GZ_w * a
-            term5 = GZ_w * (-a * RHO * jnp.sin(thZ))
-            term6 = GR_w * (h - RHO * jnp.cos(thR)) + GZ_w * (v - k * RHO * jnp.sin(thZ))
-            
-            terms_1d = jnp.stack([term1, term2, term3, term4, term5, term6], axis=0) 
-            terms_1d_t = jnp.sum(terms_1d, axis=2) 
-            terms_1d_tz = jnp.einsum('vrz,mz->vrm', terms_1d_t, basis_1d_val_slice) 
-            res_1d = jnp.einsum('lr,vrm->lvm', fac_rad, terms_1d_tz).reshape((L_rad, 6 * len_1d)) 
-            
-            if len_2d > 0:
-                term7 = GR_w * (a * RHO * jnp.sin(thR))
-                term8 = GZ_w * (-a * k * RHO * jnp.cos(thZ))
-                terms_2d = jnp.stack([term7, term8], axis=0)
-                terms_2d_r = jnp.einsum('vrtz,mrtz->vmr', terms_2d, basis_2d_val)
-                res_2d = jnp.einsum('lr,vmr->lvm', fac_rad, terms_2d_r).reshape((L_rad, 2 * len_2d))
-                res_geom = jnp.concatenate([res_1d, res_2d], axis=1).flatten()
-            else:
-                res_geom = res_1d.flatten()
-                
-            res_list = [res_geom]
-            
-            if len_lam > 0:
-                vol_w = metric_w * det_eff
-                term_lam = Jr_phys * vol_w
-                term_lam_tz = jnp.einsum('rtz,mtz->rm', term_lam, basis_lam_tz) 
-                res_lam = jnp.dot(fac_lam_proj, rho_m_lam.T * term_lam_tz)
-                res_list.append(res_lam.flatten())
-                
-            phys_res = jnp.concatenate(res_list)
+            phys_res_raw = jnp.concatenate([F_rho_norm.ravel(), F_beta_norm.ravel()])
+            n_phys_pts = phys_res_raw.size
+            phys_res = phys_res_raw / jnp.sqrt(n_phys_pts + 1.0e-10)
 
             if apply_scaling:
-                phys_res = phys_res / res_scales
-            if apply_block_normalization:
-                phys_res = phys_res / block_rms_phys
+                phys_res = phys_res
             if apply_group_weights:
                 phys_res = main_phys_weight * phys_res
 
-            final_res_list = [phys_res]
-            
-            reg_theta_parts = []
-            if len_1d > 0:
-                reg_theta_parts.append((c_c0R * theta_mode_weight_1d * reg_active_c0R * regularization_scale).flatten())
-                reg_theta_parts.append((c_c0Z * theta_mode_weight_1d * reg_active_c0Z * regularization_scale).flatten())
-                reg_theta_parts.append((c_h * theta_mode_weight_1d * reg_active_h * regularization_scale).flatten())
-                reg_theta_parts.append((c_v * theta_mode_weight_1d * reg_active_v * regularization_scale).flatten())
-                reg_theta_parts.append((c_k * theta_mode_weight_1d * reg_active_k * regularization_scale).flatten())
-                reg_theta_parts.append((c_a * theta_mode_weight_1d * reg_active_a * regularization_scale).flatten())
-            if len_2d > 0:
-                reg_theta_parts.append((c_tR * theta_mode_weight_2d * reg_active_tR * regularization_scale).flatten())
-                reg_theta_parts.append((c_tZ * theta_mode_weight_2d * reg_active_tZ * regularization_scale).flatten())
-
-            if len(reg_theta_parts) > 0:
-                reg_theta_group = []
-                if len_1d > 0:
-                    reg_1d_res = jnp.concatenate(reg_theta_parts[:6]) if len(reg_theta_parts) >= 6 else jnp.array([])
-                    if reg_1d_res.size > 0:
-                        if apply_group_weights:
-                            reg_1d_res = alpha_1d * reg_1d_res
-                        reg_theta_group.append(reg_1d_res)
-                if len_2d > 0:
-                    reg_tR_res = (c_tR * theta_mode_weight_2d * reg_active_tR * regularization_scale).flatten()
-                    reg_tZ_res = (c_tZ * theta_mode_weight_2d * reg_active_tZ * regularization_scale).flatten()
-                    if apply_group_weights:
-                        reg_tR_res = alpha_tR * reg_tR_res
-                        reg_tZ_res = alpha_tZ * reg_tZ_res
-                    reg_theta_group.append(reg_tR_res)
-                    reg_theta_group.append(reg_tZ_res)
-                if len(reg_theta_group) > 0:
-                    final_res_list.append(jnp.concatenate(reg_theta_group))
-
-            if len_lam > 0:
-                reg_lam_res = (c_lam * lambda_mode_weight * reg_active_lam * regularization_scale).flatten()
-                if apply_group_weights:
-                    reg_lam_res = alpha_lam * reg_lam_res
-                final_res_list.append(reg_lam_res)
-                
-            return jnp.concatenate(final_res_list)
+            return phys_res
             
         return jax_res_fn
 
-    def _run_optimization(self, x0, max_nfev, ftol, pressure_scale_factor=1.0, projection_cfg: Optional[Dict[str, Any]] = None):
-        # =================================================================
-        # [物理闭环终极修复 3]：卸载冗余 AL 外壳，交付原生雅可比推土机
-        # =================================================================
+    def _run_optimization(
+        self,
+        x0,
+        max_nfev,
+        ftol,
+        pressure_scale_factor=1.0,
+        projection_cfg: Optional[Dict[str, Any]] = None,
+        gtol: Optional[float] = None,
+    ):
         proj_cfg = dict(projection_cfg or {})
         self._last_projection_cfg = proj_cfg.copy()
         self.main_phys_weight = float(proj_cfg.get("main_phys_weight", 1.0))
-        self.alpha_1d = float(proj_cfg.get("alpha_1d", proj_cfg.get("reg_theta_weight", 1.0)))
-        self.alpha_tR = float(proj_cfg.get("alpha_tR", proj_cfg.get("reg_tR_weight", self.alpha_1d)))
-        self.alpha_tZ = float(proj_cfg.get("alpha_tZ", proj_cfg.get("reg_tZ_weight", self.alpha_1d)))
-        self.alpha_lam = float(proj_cfg.get("alpha_lam", proj_cfg.get("reg_lam_weight", proj_cfg.get("reg_lambda_weight", 1.0))))
-        self.theta_l_power = float(proj_cfg.get("theta_l_power", 4.0))
-        self.lam_m_power = float(proj_cfg.get("lam_m_power", 2.0))
-        self.lam_n_power = float(proj_cfg.get("lam_n_power", 2.0))
-        self.lam_l_power = float(proj_cfg.get("lam_l_power", 4.0))
         base_main_phys_weight = self.main_phys_weight
-        base_alpha_1d = self.alpha_1d
-        base_alpha_tR = self.alpha_tR
-        base_alpha_tZ = self.alpha_tZ
-        base_alpha_lam = self.alpha_lam
-        use_block_rms_normalization = bool(proj_cfg.get("use_block_rms_normalization", True))
-        block_rms_floor = float(proj_cfg.get("block_rms_floor", 1e-2))
-        block_rms_ceil = float(proj_cfg.get("block_rms_ceil", 1e2))
-        block_rms_disable_threshold = float(proj_cfg.get("block_rms_disable_threshold", 1e-6))
-        block_rms_probe_epsilon = float(proj_cfg.get("block_rms_probe_epsilon", 1e-3))
-        block_rms_probe_seed = proj_cfg.get("block_rms_probe_seed", None)
-        variable_scale_probe_epsilon = float(proj_cfg.get("variable_scale_probe_epsilon", 1e-3))
-        variable_scale_probe_seed = proj_cfg.get("variable_scale_probe_seed", block_rms_probe_seed)
-        variable_scale_floor = float(proj_cfg.get("variable_scale_floor", 1e-3))
-        variable_scale_ceil = float(proj_cfg.get("variable_scale_ceil", 1e2))
         phys_weight_start_factor = float(proj_cfg.get("phys_weight_start_factor", 0.6))
-        alpha_1d_start_factor = float(proj_cfg.get("alpha_1d_start_factor", 1.2))
-        alpha_tR_start_factor = float(proj_cfg.get("alpha_tR_start_factor", 1.2))
-        alpha_tZ_start_factor = float(proj_cfg.get("alpha_tZ_start_factor", 1.2))
-        alpha_lam_start_factor = float(proj_cfg.get("alpha_lam_start_factor", 1.5))
-        # 兼容旧字段，便于外部仍读取
-        self.reg_theta_weight = self.alpha_1d
-        self.reg_lambda_weight = self.alpha_lam
-        self.reg_tR_weight = self.alpha_tR
-        self.reg_tZ_weight = self.alpha_tZ
-        self.reg_lam_weight = self.alpha_lam
         outer_loops = int(proj_cfg.get("outer_loops", 1))
         lsq_chunk_nfev = int(proj_cfg.get("lsq_chunk_nfev", max_nfev if outer_loops <= 1 else max(20, max_nfev // outer_loops)))
-        use_exact_jacobian = bool(proj_cfg.get("use_exact_jacobian", True))
         use_weight_continuation = bool(proj_cfg.get("use_weight_continuation", outer_loops > 1))
+        ftol_opt = float(ftol)
+        gtol_opt = float(gtol) if gtol is not None else float(proj_cfg.get("gtol", ftol_opt))
         
         start_time = time.time()
-        print(f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, 纯物理驱动模式)")
-        print(f"    >>> 雅可比模式: {'JAX 精确雅可比' if use_exact_jacobian else 'SciPy 2-point 数值雅可比'}")
+        print(
+            f"    >>> 启动优化求解引擎 (网格: {self.Nr}x{self.Nt_grid}x{self.Nz_grid}, "
+            "配点力平衡残差 + Colloc 诊断, 每 50 次迭代一行)"
+        )
+        print(
+            f"    >>> L-BFGS-B 容差: ftol={ftol_opt:.3e}, gtol={gtol_opt:.3e}"
+        )
+        print("    >>> 优化模式: L-BFGS-B + JAX value_and_grad (标量损失); 不做每步 SVD")
         eval_hist = []
         self._last_eval_history = eval_hist
         active_idx = np.flatnonzero(~self.core_fixed_mask)
@@ -1145,41 +1149,70 @@ class VEQ3D_Solver:
             return x_full
 
         iter_counter = 0
-        active_var_scales_cb = np.ones(n_active, dtype=float) if n_active > 0 else np.array([], dtype=float)
+        prev_x_active_scaled: Optional[np.ndarray] = None
+        current_outer_loop = 0
+        current_chunk_nfev = 0
 
-        def iter_callback(intermediate_result):
-            nonlocal iter_counter
-            iter_counter += 1
-            if (iter_counter % 10) != 0:
-                return
-            x_iter_active_scaled = np.array(intermediate_result.x, dtype=float)
-            if n_active > 0 and active_var_scales_cb.size == x_iter_active_scaled.size:
-                x_iter_active_phys = x_iter_active_scaled * active_var_scales_cb
+        def iter_callback(intermediate_result, milestone_event: Optional[str] = None):
+            """配点法专用：点态 L2/Linf、谱尾、力平衡/divB；不做每步 SVD（开销过大）。"""
+            nonlocal iter_counter, prev_x_active_scaled, opt_active_var_scales
+            if milestone_event is None:
+                iter_counter += 1
+                if (iter_counter % 50) != 0:
+                    return
+            if hasattr(intermediate_result, "x"):
+                x_iter_active_phys = np.array(intermediate_result.x, dtype=float)
             else:
-                x_iter_active_phys = x_iter_active_scaled
+                x_iter_active_phys = np.array(intermediate_result, dtype=float)
+            scales_loc = opt_active_var_scales if opt_active_var_scales.size == x_iter_active_phys.size else np.ones_like(x_iter_active_phys)
+            x_iter_scaled = x_iter_active_phys / (scales_loc + 1e-30)
             x_iter = merge_active_to_full(x_iter_active_phys)
-            en_iter = self.metric_global_energy_terms(x_iter, pressure_scale_factor)
+            dphys = self.diagnostic_colloc_pointwise_phys(x_iter, pressure_scale_factor)
+            tail = self.metric_spectral_tail_ratio_L25(x_iter)
+            fbn = self.metric_force_balance_normalized_pointwise(x_iter, pressure_scale_factor)
+            divb_pt = self.diagnostic_divB_max_pointwise(x_iter, pressure_scale_factor)
+            fb_rel_legacy = self.metric_force_balance_rel(x_iter, pressure_scale_factor)
+
+            total_loss = float("nan")
+            g_linf = float("nan")
+            step_norm = float("nan")
+            if n_active > 0 and jac_logged is not None:
+                try:
+                    x_full_iter = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
+                    x_full_iter = x_full_iter.at[active_idx_jnp].set(jnp.array(x_iter_active_phys))
+                    r_iter = np.asarray(
+                        jax_res_fn(x_full_iter, apply_scaling=False), dtype=float
+                    ).ravel()
+                    total_loss = 0.5 * float(np.dot(r_iter, r_iter))
+                    J_sc = np.asarray(jac_logged(x_iter_scaled), dtype=float)
+                    g_iter = J_sc.T @ r_iter
+                    g_linf = float(np.max(np.abs(g_iter)))
+                    if prev_x_active_scaled is not None:
+                        step_norm = float(
+                            np.linalg.norm(x_iter_scaled - prev_x_active_scaled)
+                        )
+                    prev_x_active_scaled = np.asarray(x_iter_scaled, dtype=float).copy()
+                except Exception as ex:
+                    print(f"    [Colloc Iter] 梯度/总损失 提取失败: {ex}")
+            if milestone_event is not None:
+                print(f"    >>> [Milestone] {milestone_event}")
+            ic = f"{iter_counter:03d}" if milestone_event is None else "Mlst"
             print(
-                f"    [Iter {iter_counter:03d}] "
-                f"W_mhd={en_iter['total_energy']:.6e} "
-                f"(W_B={en_iter['magnetic_energy']:.6e}, W_p={en_iter['pressure_energy']:.6e})"
+                f"    [Iter {ic}] outer={current_outer_loop + 1}/{max(outer_loops, 1)} "
+                f"Total_Loss(0.5||r||^2)={total_loss:.3e} | Grad_Max(|J^T r|_scaled)={g_linf:.3e} | ||dx||_scaled={step_norm:.3e}"
             )
-            rb_iter = self.metric_residual_group_breakdown(x_iter, pressure_scale_factor)
-            print("    当前残差组分统计 (L2 范数):")
-            for item in rb_iter["groups"]:
-                print(
-                    f"      - {item['name_cn']:<18}: "
-                    f"未加权raw={item['norm_raw']:.6e}, "
-                    f"加权后={item['norm_weighted']:.6e}, "
-                    f"权重系数={item['effective_weight']:.6e}, "
-                    f"维度={item['size']}"
-                )
-            fb_rel_iter = self.metric_force_balance_rel(x_iter, pressure_scale_factor)
-            divb_rel_iter = self.metric_divB_rel(x_iter, pressure_scale_factor)
+            tr = float(tail["tail_ratio_L25"])
+            st = "SAFE" if tr < 1e-2 else "WARN"
             print(
-                "    迭代监控: "
-                f"force_balance_rel={fb_rel_iter:.6e}, "
-                f"divB_rel={divb_rel_iter:.6e}"
+                f"      [Phys] L2(RMS)={dphys['l2_rms']:.3e} | L_inf(Max)={dphys['l_inf']:.3e} "
+                f"at Node(rho={dphys['rho_idx']}, th={dphys['theta_idx']}, z={dphys['zeta_idx']}, rho*={dphys['rho_val']:.3e})"
+            )
+            print(
+                f"      [Spec] Chebyshev tail (top 25% L) / E_total = {tr:.3e}  [{st}]  (L_split>={tail['L_split']})"
+            )
+            print(
+                f"      [Diag] Force_norm_rel={fbn['rel_mean']*100.0:.2f}% | divB_max/(B_max/a)={divb_pt['divB_over_BoverA']:.3e} "
+                f"| force_balance_rel(legacy,vol)={fb_rel_legacy:.3e}"
             )
         
         x_curr = self._apply_fixed_core(np.array(x0, dtype=float))
@@ -1191,200 +1224,202 @@ class VEQ3D_Solver:
             if use_weight_continuation and outer_loops > 1:
                 t = float(outer_idx) / float(max(outer_loops - 1, 1))
                 phys_factor = phys_weight_start_factor + (1.0 - phys_weight_start_factor) * t
-                alpha_1d_factor = alpha_1d_start_factor + (1.0 - alpha_1d_start_factor) * t
-                alpha_tR_factor = alpha_tR_start_factor + (1.0 - alpha_tR_start_factor) * t
-                alpha_tZ_factor = alpha_tZ_start_factor + (1.0 - alpha_tZ_start_factor) * t
-                alpha_lam_factor = alpha_lam_start_factor + (1.0 - alpha_lam_start_factor) * t
             else:
                 phys_factor = 1.0
-                alpha_1d_factor = alpha_tR_factor = alpha_tZ_factor = alpha_lam_factor = 1.0
             self.main_phys_weight = base_main_phys_weight * phys_factor
-            self.alpha_1d = base_alpha_1d * alpha_1d_factor
-            self.alpha_tR = base_alpha_tR * alpha_tR_factor
-            self.alpha_tZ = base_alpha_tZ * alpha_tZ_factor
-            self.alpha_lam = base_alpha_lam * alpha_lam_factor
-            # 兼容旧字段
-            self.reg_theta_weight = self.alpha_1d
-            self.reg_lambda_weight = self.alpha_lam
-            self.reg_tR_weight = self.alpha_tR
-            self.reg_tZ_weight = self.alpha_tZ
-            self.reg_lam_weight = self.alpha_lam
-
-        def _estimate_variable_scales(x_ref):
-            scales = self._default_variable_scales()
-            if n_active <= 0 or variable_scale_probe_epsilon <= 0.0:
-                return np.clip(scales, variable_scale_floor, variable_scale_ceil)
-            x_probe = np.array(x_ref, dtype=float).copy()
-            if variable_scale_probe_seed is None:
-                noise = np.random.randn(n_active)
-            else:
-                noise = np.random.default_rng(int(variable_scale_probe_seed)).standard_normal(n_active)
-            x_probe[active_idx] = x_probe[active_idx] + variable_scale_probe_epsilon * noise
-            x_probe = self._apply_fixed_core(x_probe)
-            for name, offset, width in self._iter_core_blocks():
-                if width <= 0:
-                    continue
-                seg = x_probe[offset:offset + self.L_rad * width]
-                rms = np.sqrt(np.mean(seg**2)) if seg.size > 0 else 1.0
-                if not np.isfinite(rms) or rms <= 0.0:
-                    continue
-                scales[offset:offset + self.L_rad * width] = rms
-            return np.clip(scales, variable_scale_floor, variable_scale_ceil)
 
         def _build_fun_and_jac(jax_res_fn_local, active_var_scales):
-            active_var_scales_jnp = jnp.array(active_var_scales, dtype=float)
+            scale_jnp = jnp.array(np.asarray(active_var_scales, dtype=np.float64))
+            # 残差放大，使 0.5*||r||^2 与 Grad(·) 尺度远离下溢；不改变 r 的组分相对比例
+            LOSS_SCALE = 1.0e4
 
             @jax.jit
-            def fun_active_wrapped(x_active_scaled_arr):
+            def fun_active_wrapped(x_scaled_arr):
+                x_active_arr = x_scaled_arr * scale_jnp
                 x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
-                x_active_phys = x_active_scaled_arr * active_var_scales_jnp
-                x_full = x_full.at[active_idx_jnp].set(x_active_phys)
-                return jax_res_fn_local(x_full, apply_scaling=True)
+                x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+                return jax_res_fn_local(x_full, apply_scaling=False)
 
             @jax.jit
-            def jac_active_wrapped(x_active_arr):
-                return jax.jacfwd(fun_active_wrapped)(x_active_arr)
+            def jac_active_wrapped(x_scaled_arr):
+                return jax.jacfwd(fun_active_wrapped)(x_scaled_arr)
 
-            def fun_logged(x_arr):
-                r = np.array(fun_active_wrapped(jnp.array(x_arr)))
+            scales_np = np.asarray(active_var_scales, dtype=np.float64)
+
+            def fun_logged(x_scaled_arr):
+                r = np.array(fun_active_wrapped(jnp.array(x_scaled_arr)))
                 eval_hist.append(float(np.linalg.norm(r)))
+                x_phys = np.asarray(x_scaled_arr, dtype=np.float64) * scales_np
+                iter_callback(x_phys)
                 return r
 
-            def jac_logged(x_arr):
-                return np.array(jac_active_wrapped(jnp.array(x_arr)))
+            def jac_logged(x_scaled_arr):
+                return np.array(jac_active_wrapped(jnp.array(x_scaled_arr)))
 
-            return fun_logged, jac_logged
+            @jax.jit
+            def scalar_loss_fn(x_scaled_arr):
+                x_active_arr = x_scaled_arr * scale_jnp
+                x_full = jnp.where(fixed_mask_jnp, fixed_values_jnp, 0.0)
+                x_full = x_full.at[active_idx_jnp].set(x_active_arr)
+                res_array = jax_res_fn_local(x_full, apply_scaling=False)
+                scaled_res = res_array * LOSS_SCALE
+                return 0.5 * jnp.sum(scaled_res**2)
 
-        self.var_scales = _estimate_variable_scales(x_curr)
+            val_and_grad_fn = jax.jit(jax.value_and_grad(scalar_loss_fn))
+
+            def val_and_grad_wrapper(x_scaled_arr):
+                loss_val, grad_val = val_and_grad_fn(jnp.array(x_scaled_arr))
+                loss_np = float(np.asarray(loss_val, dtype=np.float64))
+                grad_np = np.asarray(grad_val, dtype=np.float64)
+                eval_hist.append(float(np.sqrt(max(2.0 * loss_np, 0.0))))
+                x_phys = np.asarray(x_scaled_arr, dtype=np.float64) * scales_np
+                iter_callback(x_phys)
+                return loss_np, grad_np
+
+            return fun_logged, jac_logged, val_and_grad_wrapper
+
+        # 使用块级默认 var_scales（见 _default_variable_scales），勿用 1e-3 噪声探针
+        # 否则零初值块 RMS≈eps 会盖掉 10.0/1.0/5.0 等设计，并与 ±10 缩放界耦合导致物理步长锁死
+        self.var_scales = self._default_variable_scales()
+        opt_active_var_scales = self.var_scales[active_idx] if n_active > 0 else np.array([], dtype=float)
         print(
-            "    >>> [VariableScaleInit] "
+            "    >>> [VariableScaleInit] (default block scales) "
             f"min={np.min(self.var_scales):.3e}, median={np.median(self.var_scales):.3e}, max={np.max(self.var_scales):.3e}"
         )
 
-        if use_block_rms_normalization:
-            self.block_rms_phys = 1.0
-            _set_outer_block_weights(0)
-            jax_res_fn_for_init = self._build_jax_residual_fn(pressure_scale_factor)
-            res_init = np.array(
-                jax_res_fn_for_init(
-                    jnp.array(x_curr),
-                    apply_scaling=True,
-                    apply_group_weights=False,
-                    apply_block_normalization=False,
-                ),
-                dtype=float,
-            )
-            phys_len = self.num_core_params
-            reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
-            reg_lam_len = self.L_rad * self.len_lam
-
-            idx = 0
-            block_phys = res_init[idx:idx + phys_len]
-
-            def _rms(v):
-                if v.size == 0:
-                    return 1.0
-                raw = float(np.linalg.norm(v) / np.sqrt(v.size))
-                if (not np.isfinite(raw)) or (raw < block_rms_disable_threshold):
-                    return 1.0
-                return float(np.clip(raw, block_rms_floor, block_rms_ceil))
-
-            self.block_rms_phys = _rms(block_phys)
-            print(
-                "    >>> [BlockRMSInit] "
-                f"phys={self.block_rms_phys:.3e}"
-            )
-            if n_active > 0 and block_rms_probe_epsilon > 0.0:
-                print(
-                    "    >>> [BlockRMSProbe] "
-                    f"epsilon={block_rms_probe_epsilon:.3e}, "
-                    f"seed={'None' if block_rms_probe_seed is None else int(block_rms_probe_seed)}"
-                )
-        else:
-            self.block_rms_phys = 1.0
-            print("    >>> [BlockRMSInit] 已禁用块归一化，沿用原始尺度。")
-
         if n_active == 0:
-            print("    >>> 核心参数冻结: 0 个自由变量（全部固定），跳过 least_squares。")
+            print("    >>> 核心参数冻结: 0 个自由变量（全部固定），跳过主优化器调用。")
             res = SimpleNamespace(x=x_curr.copy(), nfev=0, success=True, status=1, message="all variables fixed")
             _set_outer_block_weights(max(outer_loops - 1, 0))
             jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
 
+        jac_logged = None
         for outer in range(outer_loops if n_active > 0 else 0):
             budget_left = max_nfev - total_nfev
             if budget_left <= 0:
                 break
             this_chunk = budget_left if outer == outer_loops - 1 else min(lsq_chunk_nfev, budget_left)
+            current_outer_loop = int(outer)
+            current_chunk_nfev = int(this_chunk)
             _set_outer_block_weights(outer)
             jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
             active_var_scales = self.var_scales[active_idx] if n_active > 0 else np.array([], dtype=float)
-            active_var_scales_cb = active_var_scales
-            fun_logged, jac_logged = _build_fun_and_jac(jax_res_fn, active_var_scales)
-            print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (max_nfev={this_chunk})")
+            opt_active_var_scales = active_var_scales
+            prev_x_active_scaled = None
+            fun_logged, jac_logged, val_and_grad_wrapper = _build_fun_and_jac(jax_res_fn, active_var_scales)
+            print(f"    >>> [Outer {outer + 1}/{outer_loops}] 主优化步 (maxiter={this_chunk}, L-BFGS-B)")
             print(
                 "    >>> [WeightSchedule] "
-                f"main_phys={self.main_phys_weight:.3e}, "
-                f"alpha_1d={self.alpha_1d:.3e}, "
-                f"alpha_tR={self.alpha_tR:.3e}, "
-                f"alpha_tZ={self.alpha_tZ:.3e}, "
-                f"alpha_lam={self.alpha_lam:.3e}"
+                f"main_phys={self.main_phys_weight:.3e}"
             )
             try:
-                x_active0 = x_curr[active_idx] / active_var_scales
-                res = least_squares(
-                    fun_logged,
-                    x_active0,
-                    jac=jac_logged if use_exact_jacobian else '2-point',
-                    method='trf',
-                    xtol=ftol,
-                    ftol=ftol,
-                    max_nfev=this_chunk,
-                    verbose=2,
-                    callback=iter_callback
+                x_active0_scaled = x_curr[active_idx] / active_var_scales
+                res = minimize(
+                    val_and_grad_wrapper,
+                    x_active0_scaled,
+                    method="L-BFGS-B",
+                    jac=True,
+                    bounds=None,
+                    options={
+                        "maxiter": int(this_chunk),
+                        "ftol": ftol_opt,
+                        "gtol": gtol_opt,
+                        "disp": True,
+                        "maxcor": 50,
+                    },
                 )
             except Exception as exc:
-                err_msg = str(exc)
-                oom_like = (
-                    "RESOURCE_EXHAUSTED" in err_msg
-                    or "Out of memory" in err_msg
-                    or "out of memory" in err_msg
-                )
-                if use_exact_jacobian and oom_like:
-                    use_exact_jacobian = False
-                    print("    >>> [JacobianFallback] 检测到 JAX 雅可比内存不足，降级到 SciPy 2-point 数值雅可比继续。")
-                    res = least_squares(
-                        fun_logged,
-                        x_active0,
-                        jac='2-point',
-                        method='trf',
-                        xtol=ftol,
-                        ftol=ftol,
-                        max_nfev=this_chunk,
-                        verbose=2,
-                        callback=iter_callback
-                    )
-                else:
-                    raise
-            x_curr = merge_active_to_full(np.asarray(res.x, dtype=float) * active_var_scales)
-            total_nfev += int(res.nfev)
+                raise
+            x_curr = merge_active_to_full(np.asarray(res.x * active_var_scales, dtype=float))
+            nfev_chunk = int(getattr(res, "nfev", 0))
+            total_nfev += nfev_chunk
 
             x_curr = self._apply_fixed_core(x_curr)
+            if n_active > 0 and jac_logged is not None and jax_res_fn is not None:
+                try:
+                    otag = f"L-BFGS_outer_{current_outer_loop + 1}_of_{outer_loops}_done"
+                    iter_callback(
+                        np.asarray(x_curr[active_idx], dtype=float),
+                        milestone_event=otag,
+                    )
+                except Exception as _e_outer:
+                    print(f"    [Milestone/outer] 诊断打印失败: {_e_outer}")
+
+        if n_active > 0 and res is not None and jac_logged is not None and jax_res_fn is not None:
+            try:
+                x_curr = self._apply_fixed_core(x_curr)
+                iter_callback(
+                    np.asarray(x_curr[active_idx], dtype=float),
+                    milestone_event="phase_optimization_结束(本段最终状态)",
+                )
+            except Exception as _e_ph:
+                print(f"    [Milestone/phase] 诊断打印失败: {_e_ph}")
 
         end_time = time.time()
         if res is None:
             raise RuntimeError("优化未执行：max_nfev 预算不足")
         res.x = x_curr
         res.nfev = total_nfev
-        phys_res_final = jax_res_fn(jnp.array(x_curr), apply_scaling=True)
-        phys_len = self.num_core_params 
-        phys_res_only = phys_res_final[:phys_len]
-        fb_rel_final = self.metric_force_balance_rel(x_curr, pressure_scale_factor)
-        
-        print(f"    当前网格总耗时: {end_time - start_time:.2f} s | 总函数计算: {total_nfev} 次")
-        print(f"    纯主物理残差 L2 范数: {np.linalg.norm(phys_res_only):.4e}")
-        print(f"    归一化MHD力平衡误差: {fb_rel_final:.6e}")
-        
+        print(
+            f"    [Colloc] 本段优化结束: 耗时 {end_time - start_time:.2f} s | nfev={total_nfev}"
+        )
+        dpt = self.diagnostic_colloc_pointwise_phys(x_curr, pressure_scale_factor)
+        print(
+            f"    [Colloc] 点态 |F| RMS={dpt['l2_rms']:.3e}  L_inf={dpt['l_inf']:.3e} "
+            f"at (rho_idx,th,z)=({dpt['rho_idx']},{dpt['theta_idx']},{dpt['zeta_idx']})"
+        )
+        J_for_final = None
+        if n_active > 0 and jac_logged is not None:
+            try:
+                J_for_final = jac_logged(
+                    np.asarray(x_curr[active_idx] / self.var_scales[active_idx], dtype=float)
+                )
+            except Exception as ex:
+                print(f"    [Colloc Final] 雅可比提取失败: {ex}")
+        self.print_colloc_final_diagnostics(x_curr, pressure_scale_factor, jac_last=J_for_final)
+
         return res
+
+    def _diagnose_axis_residual_barrier(self, x_core, pressure_scale_factor=1.0, top_k=3):
+        """
+        诊断局部残差是否在磁轴层聚集（rho_idx=0）。
+        使用点态 |F| = sqrt(F_rho^2 + F_beta^2) 的每层 max 统计。
+        """
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        F_rho = np.asarray(s["F_rho"], dtype=float)
+        F_beta = np.asarray(s["F_beta"], dtype=float)
+        P_ref_val = float(max(getattr(self, "P_ref", 1.0), 1e-30))
+        F_mag = np.sqrt(F_rho**2 + F_beta**2) / P_ref_val
+        if F_mag.ndim != 3 or F_mag.shape[0] <= 0:
+            return {
+                "axis_idx": 0,
+                "max_idx": 0,
+                "max_rho": 0.0,
+                "max_val": 0.0,
+                "axis_val": 0.0,
+                "axis_to_max_ratio": 0.0,
+                "axis_is_max": True,
+                "top_layers": [(0, 0.0, 0.0)],
+            }
+        layer_max = np.max(F_mag, axis=(1, 2))
+        rho_arr = np.asarray(self.rho, dtype=float)
+        axis_idx = int(np.argmin(np.abs(rho_arr)))
+        max_idx = int(np.argmax(layer_max))
+        max_val = float(layer_max[max_idx])
+        axis_val = float(layer_max[axis_idx])
+        order = np.argsort(layer_max)[::-1]
+        k = int(max(1, min(top_k, layer_max.size)))
+        top_layers = [(int(i), float(rho_arr[i]), float(layer_max[i])) for i in order[:k]]
+        return {
+            "axis_idx": axis_idx,
+            "max_idx": max_idx,
+            "max_rho": float(rho_arr[max_idx]),
+            "max_val": max_val,
+            "axis_val": axis_val,
+            "axis_to_max_ratio": float(axis_val / (max_val + 1e-30)),
+            "axis_is_max": bool(axis_idx == max_idx),
+            "top_layers": top_layers,
+        }
 
     def _spectral_grad_th_np(self, f):
         return np.real(np.fft.ifft(1j * self.k_th * np.fft.fft(f, axis=1), axis=1))
@@ -1481,6 +1516,7 @@ class VEQ3D_Solver:
         Bz_sup = (Phip + Lt) / (2 * np.pi * sqrt_g)
         Br_sup = np.zeros_like(Bt_sup)
 
+        # B^θ,B^ζ -> B_θ,B_ζ；∇×B 的 θ/ζ 导数作用在协变分量上
         Br_sub = g_rt * Bt_sup + g_rz * Bz_sup
         Bt_sub = g_tt * Bt_sup + g_tz * Bz_sup
         Bz_sub = g_tz * Bt_sup + g_zz * Bz_sup
@@ -1488,14 +1524,17 @@ class VEQ3D_Solver:
         dBt_drho = np.tensordot(D_matrix, Bt_sub, axes=(1, 0))
         dBz_drho = np.tensordot(D_matrix, Bz_sub, axes=(1, 0))
 
-        Jz_sup = (dBt_drho - self._spectral_grad_th_np(Br_sub)) / sqrt_g
-        Jt_sup = (self._spectral_grad_ze_np(Br_sub) - dBz_drho) / sqrt_g
-        Jr_sup = (self._spectral_grad_th_np(Bz_sub) - self._spectral_grad_ze_np(Bt_sub)) / sqrt_g
+        Jz_unscaled = dBt_drho - self._spectral_grad_th_np(Br_sub)
+        Jt_unscaled = self._spectral_grad_ze_np(Br_sub) - dBz_drho
+        Jr_unscaled = self._spectral_grad_th_np(Bz_sub) - self._spectral_grad_ze_np(Bt_sub)
+        Jz_sup = Jz_unscaled / sqrt_g
+        Jt_sup = Jt_unscaled / sqrt_g
+        Jr_sup = Jr_unscaled / sqrt_g
         Jr_phys = Jr_sup / self.mu_0
 
-        G_rho = dP - sqrt_g * (Jt_sup * Bz_sup - Jz_sup * Bt_sup) / self.mu_0
-        F_rho = G_rho
-        F_beta = (Jr_phys / (2 * np.pi)) * (Phip + Lt)
+        F_rho = dP - (Jt_unscaled * Bz_sub - Jz_unscaled * Bt_sub) / self.mu_0
+        F_beta = Jr_unscaled / self.mu_0
+        G_rho = F_rho
 
         return {
             "R": R, "Z": Z, "Rr": Rr, "Rt": Rt, "Rz": Rz, "Zr": Zr, "Zt": Zt, "Zz": Zz,
@@ -1592,6 +1631,44 @@ class VEQ3D_Solver:
         # 验证指标使用正权重，避免手性符号导致的积分抵消或负权重 sqrt 数值问题
         return np.abs(state["sqrt_g"]) * self.weights_3d * self.dtheta * self.dzeta
 
+    def metric_force_free_alignment(self, x_core, pressure_scale_factor=0.0):
+        """
+        无力场平行度代理量（P=0 时尤为关键）：
+        sigma_error = sqrt( ∫|JxB|^2 dV / ∫(|J|^2|B|^2) dV )
+        """
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w = self._volume_weights(s)
+
+        Jr, Jt, Jz = s["Jr_sup"], s["Jt_sup"], s["Jz_sup"]
+        Br, Bt, Bz = s["Br_sup"], s["Bt_sup"], s["Bz_sup"]
+        g_rr, g_tt, g_zz = s["g_rr"], s["g_tt"], s["g_zz"]
+        g_rt, g_rz, g_tz = s["g_rt"], s["g_rz"], s["g_tz"]
+
+        J2 = (
+            g_rr * Jr * Jr + g_tt * Jt * Jt + g_zz * Jz * Jz
+            + 2.0 * (g_rt * Jr * Jt + g_rz * Jr * Jz + g_tz * Jt * Jz)
+        )
+        B2 = (
+            g_rr * Br * Br + g_tt * Bt * Bt + g_zz * Bz * Bz
+            + 2.0 * (g_rt * Br * Bt + g_rz * Br * Bz + g_tz * Bt * Bz)
+        )
+        JdotB = (
+            g_rr * Jr * Br + g_tt * Jt * Bt + g_zz * Jz * Bz
+            + g_rt * (Jr * Bt + Jt * Br)
+            + g_rz * (Jr * Bz + Jz * Br)
+            + g_tz * (Jt * Bz + Jz * Bt)
+        )
+
+        cross2 = np.maximum(J2 * B2 - JdotB**2, 0.0)
+        num = float(np.sum(w * cross2))
+        den = float(np.sum(w * np.maximum(J2 * B2, 0.0)))
+        sigma = np.sqrt(num / (den + 1e-30))
+        return {
+            "sigma_error": float(sigma),
+            "numerator": num,
+            "denominator": den,
+        }
+
     def metric_force_balance_L2(self, x_core, pressure_scale_factor=1.0):
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
         w = self._volume_weights(s)
@@ -1604,6 +1681,55 @@ class VEQ3D_Solver:
         lhs = np.sqrt(np.sum(w * (s["F_rho"] ** 2 + s["F_beta"] ** 2)))
         rhs = np.sqrt(np.sum(w * (s["dP"] ** 2))) + 1e-14
         return float(lhs / rhs)
+
+    def metric_edge_force_lock_ratio(self, x_core, pressure_scale_factor=1.0):
+        """
+        边界力锁定比（Edge Force Lock Ratio）：
+        lock_ratio = sum(|F| at rho=edge) / sum(|F| all)
+        当 lock_ratio > 0.8 且内层平均受力远小于边界层时，判定为边界锁定。
+        """
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        F_rho = np.asarray(s["F_rho"], dtype=float)
+        F_beta = np.asarray(s["F_beta"], dtype=float)
+        F_mag = np.sqrt(F_rho**2 + F_beta**2)
+        if F_mag.ndim != 3 or F_mag.shape[0] <= 0:
+            return {
+                "edge_force": 0.0,
+                "inner_force": 0.0,
+                "total_force": 0.0,
+                "lock_ratio": 0.0,
+                "edge_mean": 0.0,
+                "inner_mean": 0.0,
+                "inner_to_edge_mean_ratio": np.nan,
+                "is_edge_force_lock": False,
+            }
+
+        edge_layer = F_mag[-1, :, :]
+        edge_force = float(np.sum(edge_layer))
+        total_force = float(np.sum(F_mag))
+        inner_force = float(max(total_force - edge_force, 0.0))
+        lock_ratio = float(edge_force / (total_force + 1e-15))
+
+        edge_mean = float(np.mean(edge_layer))
+        if F_mag.shape[0] > 1:
+            inner_bulk = F_mag[:-1, :, :]
+            inner_mean = float(np.mean(inner_bulk))
+        else:
+            inner_mean = 0.0
+        inner_to_edge = float(inner_mean / (edge_mean + 1e-15))
+        inner_is_small = bool(inner_to_edge < 0.2)
+        is_lock = bool((lock_ratio > 0.8) and inner_is_small)
+
+        return {
+            "edge_force": edge_force,
+            "inner_force": inner_force,
+            "total_force": total_force,
+            "lock_ratio": lock_ratio,
+            "edge_mean": edge_mean,
+            "inner_mean": inner_mean,
+            "inner_to_edge_mean_ratio": inner_to_edge,
+            "is_edge_force_lock": is_lock,
+        }
 
     def metric_divB_L2(self, x_core, pressure_scale_factor=1.0):
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
@@ -1670,7 +1796,7 @@ class VEQ3D_Solver:
     def metric_profile_reconstruction_error(self, x_core, pressure_scale_factor=1.0):
         s = self._compute_state_numpy(x_core, pressure_scale_factor)
         dP_est = self._surface_mean_tz(
-            s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sup"] - s["Jz_sup"] * s["Bt_sup"]) / self.mu_0
+            (s["sqrt_g"] * (s["Jt_sup"] * s["Bz_sub"] - s["Jz_sup"] * s["Bt_sub"])) / self.mu_0
         )
         dP_tar = self._surface_mean_tz(s["dP"])
         P_tar = self._surface_mean_tz(s["P"])
@@ -1789,6 +1915,190 @@ class VEQ3D_Solver:
         ratios["max_tail_ratio"] = float(max(ratios.values()) if len(ratios) > 0 else 0.0)
         return ratios
 
+    def metric_spectral_tail_ratio_L25(self, x_core):
+        """后 25% 径向 Chebyshev 阶能量占比（抗混叠；宜 <1e-2 量级）。"""
+        c_c0R, c_c0Z, c_h, c_v, c_k, c_a, c_tR, c_tZ, c_lam = self.unpack_core(x_core)
+        blocks = [c_c0R, c_c0Z, c_h, c_v, c_k, c_a]
+        if self.len_2d > 0:
+            blocks += [c_tR, c_tZ]
+        if self.len_lam > 0:
+            blocks.append(c_lam)
+        total_e, tail_e = 0.0, 0.0
+        Lr = int(self.L_rad)
+        if Lr <= 0:
+            return {"tail_ratio_L25": 0.0, "L_split": 0}
+        i0 = int(np.ceil(0.75 * Lr))
+        for arr in blocks:
+            if arr is None or arr.size == 0:
+                continue
+            a = np.asarray(arr, dtype=float)
+            e = float(np.sum(a**2))
+            total_e += e
+            if i0 < Lr:
+                tail_e += float(np.sum(a[i0:, :] ** 2))
+        ratio = float(tail_e / (total_e + 1e-30))
+        return {"tail_ratio_L25": ratio, "L_split": i0}
+
+    def diagnostic_colloc_pointwise_phys(self, x_core, pressure_scale_factor=1.0):
+        """点态 F_rho/F_beta：RMS、Linf、argmax 网格索引（配点法核心监控）。"""
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        Fr = np.asarray(s["F_rho"], dtype=float)
+        Fb = np.asarray(s["F_beta"], dtype=float)
+        F_mag = np.sqrt(Fr**2 + Fb**2)
+        l2_rms = float(np.sqrt(np.mean(F_mag**2)))
+        linf = float(np.max(F_mag))
+        im = int(np.argmax(F_mag.ravel()))
+        Nr, Nt, Nz = F_mag.shape
+        ir, it, iz = np.unravel_index(im, (Nr, Nt, Nz))
+        return {
+            "l2_rms": l2_rms,
+            "l_inf": linf,
+            "rho_idx": int(ir),
+            "theta_idx": int(it),
+            "zeta_idx": int(iz),
+            "rho_val": float(self.rho[ir]) if Nr > 0 else 0.0,
+        }
+
+    def diagnostic_least_squares_loss_split(self, x_core, pressure_scale_factor=1.0, apply_group_weights: bool = False):
+        """仅配点力平衡残差 0.5||r||^2（与 _build_jax_residual_fn 一致）。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+        x_eff = self._apply_fixed_core(x_core)
+        r = np.array(
+            jax_res_fn(
+                jnp.array(x_eff),
+                apply_scaling=False,
+                apply_group_weights=apply_group_weights,
+            ),
+            dtype=float,
+        ).ravel()
+        loss_p = 0.5 * float(np.dot(r, r))
+        return {
+            "loss_total": loss_p,
+            "loss_phys": loss_p,
+            "loss_theta_reg": 0.0,
+            "loss_lam_reg": 0.0,
+            "loss_reg": 0.0,
+            "reg_over_phys": 0.0,
+        }
+
+    def metric_force_balance_normalized_pointwise(self, x_core, pressure_scale_factor=1.0):
+        """
+        mean(||F||) / mean(|dP| + |JxB|) 风格归一化力误差（<1% 为优）。
+        F 取通量面坐标力残差模；|JxB| 用 sqrt(J^2 B^2 - (J·B)^2) 有界形式。
+        """
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        w = self._volume_weights(s)
+        Fr, Fb = s["F_rho"], s["F_beta"]
+        F_mag = np.sqrt(Fr**2 + Fb**2)
+        dP = np.abs(s["dP"])
+        Jr, Jt, Jz = s["Jr_sup"], s["Jt_sup"], s["Jz_sup"]
+        Br, Bt, Bz = s["Br_sup"], s["Bt_sup"], s["Bz_sup"]
+        g_rr, g_tt, g_zz = s["g_rr"], s["g_tt"], s["g_zz"]
+        g_rt, g_rz, g_tz = s["g_rt"], s["g_rz"], s["g_tz"]
+        J2 = (
+            g_rr * Jr * Jr + g_tt * Jt * Jt + g_zz * Jz * Jz
+            + 2.0 * (g_rt * Jr * Jt + g_rz * Jr * Jz + g_tz * Jt * Jz)
+        )
+        B2 = (
+            g_rr * Br * Br + g_tt * Bt * Bt + g_zz * Bz * Bz
+            + 2.0 * (g_rt * Br * Bt + g_rz * Br * Bz + g_tz * Bt * Bz)
+        )
+        JdotB = (
+            g_rr * Jr * Br + g_tt * Jt * Bt + g_zz * Jz * Bz
+            + g_rt * (Jr * Bt + Jt * Br)
+            + g_rz * (Jr * Bz + Jz * Br)
+            + g_tz * (Jt * Bz + Jz * Bt)
+        )
+        jxb_mag = np.sqrt(np.maximum(J2 * B2 - JdotB**2, 0.0))
+        scale = dP + jxb_mag
+        num = float(np.sum(w * F_mag) / (np.sum(w) + 1e-30))
+        den = float(np.sum(w * scale) / (np.sum(w) + 1e-30))
+        ratio = num / (den + 1e-30)
+        return {
+            "mean_F": num,
+            "mean_scale_dP_plus_JxB": den,
+            "rel_mean": ratio,
+        }
+
+    def diagnostic_divB_max_pointwise(self, x_core, pressure_scale_factor=1.0):
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        sqrtg = s["sqrt_g"]
+        divB = (self._spectral_grad_th_np(sqrtg * s["Bt_sup"]) + self._spectral_grad_ze_np(sqrtg * s["Bz_sup"])) / sqrtg
+        B_mag = np.sqrt(
+            np.maximum(s["Bt_sup"] * s["Bt_sub"] + s["Bz_sup"] * s["Bz_sub"], 0.0)
+        )
+        a0 = max(self._compute_fitted_minor_radius(), 1e-14)
+        divb_max = float(np.max(np.abs(divB)))
+        b_max = float(np.max(B_mag) + 1e-30)
+        ref = b_max / a0
+        return {"divB_max": divb_max, "B_max": b_max, "divB_over_BoverA": float(divb_max / (ref + 1e-30)), "a0": a0}
+
+    def metric_Jphi_radial_roughness(self, x_core, pressure_scale_factor=1.0):
+        """Jt 角向/环向上相对涨落沿 rho 的均值（越小越光滑）。"""
+        s = self._compute_state_numpy(x_core, pressure_scale_factor)
+        Jt = np.asarray(s["Jt_sup"], dtype=float)
+        mabs = np.mean(np.abs(Jt), axis=(1, 2)) + 1e-30
+        jstd = np.std(Jt, axis=(1, 2))
+        return float(np.mean(jstd / mabs))
+
+    def print_colloc_final_diagnostics(
+        self,
+        x_core,
+        pressure_scale_factor: float = 1.0,
+        jac_last: Any = None,
+    ):
+        """优化或求解结束：归一化力、divB 刚性、雅可比 SVD、剖面/电流（ASCII 安全）。"""
+        print("\n" + "-" * 70)
+        print(">>> [Colloc Final] 深度体检（点态/谱/条件数/剖面）")
+        print("-" * 70)
+        fb = self.metric_force_balance_normalized_pointwise(x_core, pressure_scale_factor)
+        print(
+            f"    (1) 力平衡(均值归一) mean|F| / mean(|dP|+|JxB|) = {fb['rel_mean']:.6e}  (优质一般 <0.01)"
+        )
+        db = self.diagnostic_divB_max_pointwise(x_core, pressure_scale_factor)
+        print(
+            f"    (2) divB: max|divB|={db['divB_max']:.6e}  B_max={db['B_max']:.6e}  "
+            f"divB/(B_max/a0)={db['divB_over_BoverA']:.6e}  (a0={db['a0']:.4e})"
+        )
+        if jac_last is not None:
+            J = np.asarray(jac_last, dtype=float)
+            try:
+                s = np.linalg.svd(J, compute_uv=False)
+                smax = float(s[0]) if s.size else 0.0
+                smin = float(s[-1]) if s.size else 0.0
+                kappa = smax / (smin + 1e-30)
+                tol = 1e-8 * (smax + 1e-30)
+                nnull = int(np.sum(s < tol))
+                print(
+                    f"    (3) 雅可比 SVD: kappa={kappa:.2e}  near-null count={nnull}  (tol~{tol:.1e})"
+                )
+            except Exception as ex:
+                print(f"    (3) 雅可比 SVD: 计算失败 ({ex})")
+        else:
+            print("    (3) 雅可比 SVD: 跳过 (无雅可比)")
+
+        ax = self.metric_axis_location(x_core)
+        R0g = float(self.p_edge[0]) if self.p_edge is not None else float(ax["R_mean"])
+        dR = float(ax["R_mean"] - R0g)
+        print(
+            f"    (4) Shafranov 位移: R_axis_mean - R0_edge0 ~ {dR:.6e}  "
+            f"(R_axis_mean={ax['R_mean']:.6f}, axis_R_std={ax['R_std']:.3e})"
+        )
+        iot = self.metric_rotational_transform_error(x_core, pressure_scale_factor)
+        ir = iot["iota_recon"]
+        q0 = float(1.0 / (ir[0] + 1e-30))
+        q1 = float(1.0 / (ir[-1] + 1e-30))
+        print(f"    (5) 安全因子代理: q0~1/iota(0)={q0:.4f}   q_edge~1/iota(1)={q1:.4f}")
+        jr = self.metric_Jphi_radial_roughness(x_core, pressure_scale_factor)
+        print(f"    (6) 电流角向涨落(代理) mean_t,z(std|Jt|/mean|Jt|) along rho = {jr:.6e}")
+        tail = self.metric_spectral_tail_ratio_L25(x_core)
+        tr = tail["tail_ratio_L25"]
+        tag = "SAFE" if tr < 1e-2 else "WARN"
+        print(
+            f"    (7) 谱尾 L>={tail['L_split']} 能量比 = {tr:.3e}  [{tag}]"
+        )
+        print("-" * 70 + "\n")
+
     def metric_residual_drop_history(self):
         hist = np.array(getattr(self, "_all_eval_history", []), dtype=float)
         if hist.size == 0:
@@ -1827,46 +2137,63 @@ class VEQ3D_Solver:
             "svd_smax": smax,
         }
 
-    def metric_penalty_ratio(self, x_core, pressure_scale_factor=1.0):
-        """物理残差与惩罚/正则残差比例（禁用 scaling）。"""
-        breakdown = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
-        norm_phys = breakdown["norm_phys_unscaled"]
-        norm_pen = breakdown["norm_penalty_unscaled"]
-        ratio = norm_pen / (norm_phys + 1e-14)
+    def metric_jacobian_column_entropy(self, x_core, pressure_scale_factor=1.0):
+        """雅可比列敏感度熵：用于诊断参数 Dead-Zone。"""
+        jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
+
+        @jax.jit
+        def fun_wrapped(x_arr):
+            return jax_res_fn(x_arr, apply_scaling=False)
+
+        @jax.jit
+        def jac_wrapped(x_arr):
+            return jax.jacfwd(fun_wrapped)(x_arr)
+
+        J = np.array(jac_wrapped(jnp.array(x_core)))
+        col_norms = np.linalg.norm(J, axis=0)
+        n_col = int(col_norms.size)
+        col_sum = float(np.sum(col_norms))
+        if n_col <= 1:
+            entropy = 0.0
+            max_entropy = 0.0
+            ratio = 1.0
+        elif col_sum <= 0.0:
+            entropy = 0.0
+            max_entropy = float(np.log(n_col))
+            ratio = 0.0
+        else:
+            p = col_norms / (col_sum + 1e-15)
+            entropy = float(-np.sum(p * np.log(p + 1e-15)))
+            max_entropy = float(np.log(n_col))
+            ratio = float(entropy / (max_entropy + 1e-15))
         return {
-            "norm_phys_unscaled": norm_phys,
-            "norm_penalty_unscaled": norm_pen,
-            "penalty_ratio": ratio,
+            "entropy": entropy,
+            "max_entropy": max_entropy,
+            "ratio": ratio,
+            "dead_zone_flag": bool(ratio < 0.2),
+        }
+
+    def metric_penalty_ratio(self, x_core, pressure_scale_factor=1.0):
+        """兼容旧验证套件：已无独立惩罚残差，penalty_ratio 恒为 0。"""
+        bd = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
+        return {
+            "norm_phys_unscaled": bd["norm_phys_unscaled"],
+            "norm_penalty_unscaled": 0.0,
+            "penalty_ratio": 0.0,
         }
 
     def metric_penalty_breakdown(self, x_core, pressure_scale_factor=1.0):
-        """将惩罚项拆分为 reg_theta(非Lambda)/reg_lambda 两类（禁用 scaling）。"""
+        """仅主物理残差范数；正则项字段保持为 0 以兼容 run_validation_suite。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         x_eff = self._apply_fixed_core(x_core)
         res_all = np.array(jax_res_fn(jnp.array(x_eff), apply_scaling=False), dtype=float)
-        phys_len = self.num_core_params
-        res_phys = res_all[:phys_len]
-        res_pen_all = res_all[phys_len:]
-
-        reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
-        reg_lam_len = self.L_rad * self.len_lam
-
-        idx = 0
-        res_reg_theta = res_pen_all[idx:idx + reg_theta_len]
-        idx += reg_theta_len
-        res_reg_lam = res_pen_all[idx:idx + reg_lam_len]
-
-        res_pen = np.concatenate([res_reg_theta, res_reg_lam]) if (
-            (res_reg_theta.size + res_reg_lam.size) > 0
-        ) else np.array([], dtype=float)
-        norm_phys = float(np.linalg.norm(res_phys))
-        norm_pen = float(np.linalg.norm(res_pen))
+        norm_phys = float(np.linalg.norm(res_all))
         return {
             "norm_phys_unscaled": norm_phys,
             "norm_profile_penalty_unscaled": 0.0,
-            "norm_reg_theta_unscaled": float(np.linalg.norm(res_reg_theta)),
-            "norm_reg_lam_unscaled": float(np.linalg.norm(res_reg_lam)),
-            "norm_penalty_unscaled": norm_pen,
+            "norm_reg_theta_unscaled": 0.0,
+            "norm_reg_lam_unscaled": 0.0,
+            "norm_penalty_unscaled": 0.0,
         }
 
     def metric_scaling_masking(self, x_core, pressure_scale_factor=1.0):
@@ -1883,7 +2210,7 @@ class VEQ3D_Solver:
         }
 
     def metric_residual_group_breakdown(self, x_core, pressure_scale_factor=1.0):
-        """按组分拆分残差，返回未加权 raw 与加权后 residual。"""
+        """仅主物理残差组分（未加权 / main_phys_weight 加权）。"""
         jax_res_fn = self._build_jax_residual_fn(pressure_scale_factor)
         x_eff = self._apply_fixed_core(x_core)
         res_raw = np.array(
@@ -1894,53 +2221,21 @@ class VEQ3D_Solver:
             jax_res_fn(jnp.array(x_eff), apply_scaling=False, apply_group_weights=True),
             dtype=float,
         )
-
-        phys_len = self.num_core_params
-        reg_theta_len = self.L_rad * (6 * self.len_1d + 2 * self.len_2d)
-        reg_lam_len = self.L_rad * self.len_lam
-
-        groups_meta = [
-            ("main_phys", "主物理残差", phys_len),
-            ("reg_theta", "正则项 Theta(非Lambda)", reg_theta_len),
-            ("reg_lam", "正则项 Lambda", reg_lam_len),
-        ]
-
-        idx = 0
-        groups = []
-        for key, name_cn, glen in groups_meta:
-            glen = int(max(0, glen))
-            g_raw = res_raw[idx:idx + glen]
-            g_weighted = res_weighted[idx:idx + glen]
-            idx += glen
-            norm_raw = float(np.linalg.norm(g_raw))
-            norm_weighted = float(np.linalg.norm(g_weighted))
-            groups.append({
-                "key": key,
-                "name_cn": name_cn,
-                "size": glen,
-                "norm_raw": norm_raw,
-                "norm_weighted": norm_weighted,
-                "effective_weight": float(norm_weighted / (norm_raw + 1e-14)),
-            })
-
-        if idx < res_raw.size:
-            tail_raw = res_raw[idx:]
-            tail_weighted = res_weighted[idx:]
-            norm_raw = float(np.linalg.norm(tail_raw))
-            norm_weighted = float(np.linalg.norm(tail_weighted))
-            groups.append({
-                "key": "tail_unknown",
-                "name_cn": "未分类尾部",
-                "size": int(res_raw.size - idx),
-                "norm_raw": norm_raw,
-                "norm_weighted": norm_weighted,
-                "effective_weight": float(norm_weighted / (norm_raw + 1e-14)),
-            })
-
+        phys_len = int(res_raw.size)
+        norm_raw = float(np.linalg.norm(res_raw))
+        norm_weighted = float(np.linalg.norm(res_weighted))
+        groups = [{
+            "key": "main_phys",
+            "name_cn": "主物理残差",
+            "size": phys_len,
+            "norm_raw": norm_raw,
+            "norm_weighted": norm_weighted,
+            "effective_weight": float(norm_weighted / (norm_raw + 1e-14)),
+        }]
         return {
             "groups": groups,
-            "norm_total_raw": float(np.linalg.norm(res_raw)),
-            "norm_total_weighted": float(np.linalg.norm(res_weighted)),
+            "norm_total_raw": norm_raw,
+            "norm_total_weighted": norm_weighted,
         }
 
     def metric_directional_spectral_blocking(self, x_core):
@@ -2022,10 +2317,12 @@ class VEQ3D_Solver:
         tail = self.metric_spectral_tail_ratio(x_core)
         hist = self.metric_residual_drop_history()
         cond = self.metric_conditioning_proxy(x_core, pressure_scale_factor)
+        jce = self.metric_jacobian_column_entropy(x_core, pressure_scale_factor)
         ppr = self.metric_penalty_ratio(x_core, pressure_scale_factor)
         pbd = self.metric_penalty_breakdown(x_core, pressure_scale_factor)
         smf = self.metric_scaling_masking(x_core, pressure_scale_factor)
         block = self.metric_directional_spectral_blocking(x_core)
+        edge_lock = self.metric_edge_force_lock_ratio(x_core, pressure_scale_factor)
         conv = self.metric_resolution_convergence(x_core, pressure_scale_factor)
 
         print(">>> 标量指标（直接数值 + 目标最优值）")
@@ -2057,6 +2354,8 @@ class VEQ3D_Solver:
         self._print_scalar_metric("residual_final", hist["final"], "接近 0 (越小越好)")
         self._print_scalar_metric("conditioning_col_ratio", cond["column_norm_ratio"], "尽可能小")
         self._print_scalar_metric("conditioning_svd_est", cond["svd_condition_est"], "尽可能小")
+        self._print_scalar_metric("jacobian_col_entropy_ratio", jce["ratio"], ">= 0.2 (避免 Dead-Zone)")
+        self._print_scalar_metric("edge_force_lock_ratio", edge_lock["lock_ratio"], "<= 0.8 (越小越好)")
 
         print(">>> 优化健康度与求解器诊断指标")
         ppr_flag = "PASS" if ppr["penalty_ratio"] < 0.1 else ("WARN" if ppr["penalty_ratio"] < 1.0 else "FAIL")
@@ -2065,6 +2364,8 @@ class VEQ3D_Solver:
         ab_max = max(block["angular_blocking_R"], block["angular_blocking_Z"])
         rb_flag = "PASS" if rb_max < 1e-3 else ("WARN" if rb_max < 1e-2 else "FAIL")
         ab_flag = "PASS" if ab_max < 1e-3 else ("WARN" if ab_max < 1e-2 else "FAIL")
+        jce_flag = "PASS" if jce["ratio"] >= 0.2 else "WARN"
+        edge_flag = "LOCK" if edge_lock["is_edge_force_lock"] else ("WARN" if edge_lock["lock_ratio"] > 0.8 else "PASS")
 
         print(
             f"    - physics_to_penalty_ratio        : {ppr['penalty_ratio']:.6e} "
@@ -2085,6 +2386,18 @@ class VEQ3D_Solver:
             f"    - angular_spectral_blocking_max   : {ab_max:.6e} "
             f"[{ab_flag}: 推荐 < 1e-3]"
         )
+        print(
+            f"    - jacobian_col_entropy_ratio      : {jce['ratio']:.6e} "
+            f"[{jce_flag}: 推荐 >= 2e-1]"
+        )
+        print(
+            f"    - edge_force_lock_ratio           : {edge_lock['lock_ratio']:.6e} "
+            f"[{edge_flag}: 判据 lock_ratio>0.8 且 inner/edge_mean<0.2]"
+        )
+        print(
+            f"    - inner_to_edge_mean_ratio        : {edge_lock['inner_to_edge_mean_ratio']:.6e} "
+            f"[参考: 越小表示内层受力越弱]"
+        )
 
         fig = plt.figure(figsize=(16, 14))
         gs = fig.add_gridspec(3, 2)
@@ -2098,13 +2411,19 @@ class VEQ3D_Solver:
         ax1.grid(alpha=0.3)
 
         ax2 = fig.add_subplot(gs[0, 1])
-        ax2.plot(prof["rho"], prof["P_target"], label="P target")
-        ax2.plot(prof["rho"], prof["P_recon"], "--", label="P recon")
-        ax2.plot(prof["rho"], prof["dP_target"], label="dP/drho target")
-        ax2.plot(prof["rho"], prof["dP_recon"], "--", label="dP/drho recon")
+        # P 与 dP/dρ 量纲/数值量级常差几个数量级，同 y 轴会导致 P 曲线缩在 0 附近被误判为「压强=0」
+        ax2.plot(prof["rho"], prof["P_target"], color="C0", label="P target (edge=0 规范)")
+        ax2.plot(prof["rho"], prof["P_recon"], "--", color="C1", label="P recon (edge=0 规范)")
+        ax2.set_ylabel("P (归一化, △=边减)")
+        ax2p = ax2.twinx()
+        ax2p.plot(prof["rho"], prof["dP_target"], color="C2", label="dP/drho target")
+        ax2p.plot(prof["rho"], prof["dP_recon"], "--", color="C3", label="dP/drho recon")
+        ax2p.set_ylabel("dP/dρ (归一化)")
+        h1, l1 = ax2.get_legend_handles_labels()
+        h2, l2 = ax2p.get_legend_handles_labels()
+        ax2.legend(h1 + h2, l1 + l2, fontsize="small", loc="center right")
         ax2.set_title("Profile reconstruction")
         ax2.set_xlabel("rho")
-        ax2.legend(fontsize="small")
         ax2.grid(alpha=0.3)
 
         ax3 = fig.add_subplot(gs[1, 0])
@@ -2143,7 +2462,6 @@ class VEQ3D_Solver:
         ax6.grid(alpha=0.3)
 
         plt.tight_layout()
-        plt.show()
 
         fig2, (bx1, bx2) = plt.subplots(1, 2, figsize=(14, 5))
         grids = [f"{c['Nr']}x{c['Nt']}x{c['Nz']}" for c in conv]
@@ -2159,20 +2477,35 @@ class VEQ3D_Solver:
         bx2.set_xlabel("grid")
         bx2.grid(alpha=0.3)
         plt.tight_layout()
+        # 一次 show 同时刷新两张图，减少交互后端阻塞/重绘轮次
         plt.show()
 
         print("=" * 70 + "\n")
 
-    def _run_three_phase_optimization(self, x_guess=None, phase_title_prefix=""):
+    def _run_three_phase_optimization(self, x_guess=None, phase_title_prefix="", is_pilot=False):
         def make_even(x): return x + (x % 2)
-        c_Nr_raw = make_even(max(10, 4 * self.L_rad + 2))
+
+        L_target = int(self.L_rad)
+        mask_full = np.asarray(self.core_fixed_mask, dtype=bool).copy()
+        val_full = np.asarray(self.core_fixed_values, dtype=float).copy()
+
+        if not is_pilot:
+            c_Nr_raw = make_even(max(10, 4 * 3 + 2))
+            m_Nr_raw = make_even(max(10, 4 * 4 + 2))
+        else:
+            c_Nr_raw = make_even(max(10, 4 * L_target + 2))
+            m_Nr_raw = make_even(c_Nr_raw + 4)
         c_Nt_raw = make_even(max(12, 4 * self.M_pol + 4))
         c_Nz_raw = make_even(max(8, 4 * self.N_tor + 2))
-        m_Nr_raw = make_even(c_Nr_raw + 4)
+        if not is_pilot:
+            m_Nr_raw = make_even(max(m_Nr_raw, c_Nr_raw + 4))
         m_Nt_raw = make_even(c_Nt_raw + 6)
         m_Nz_raw = make_even(c_Nz_raw + 4)
 
-        h_Nr = make_even(max(4, int(self.target_Nr)))
+        if not is_pilot:
+            h_Nr = make_even(max(4 * L_target + 2, int(self.target_Nr)))
+        else:
+            h_Nr = make_even(max(4, int(self.target_Nr)))
         h_Nt = make_even(max(4, int(self.target_Nt)))
         h_Nz = make_even(max(4, int(self.target_Nz)))
 
@@ -2186,80 +2519,125 @@ class VEQ3D_Solver:
 
         phase_total_start_time = time.time()
         self._all_eval_history = []
-        x0 = np.zeros(self.num_core_params) if x_guess is None else np.asarray(x_guess, dtype=float)
+        if not is_pilot:
+            self._set_spectral_L(3, mask_full, val_full, L_target)
+        L_prev = int(self.L_rad)
+
+        if x_guess is None:
+            x0 = np.zeros(self.num_core_params, dtype=float)
+        else:
+            x0 = self._core_x_to_L(np.asarray(x_guess, dtype=float), L_target, self.L_rad)
         x0 = self._apply_fixed_core(x0)
 
-        print("\n" + "="*70)
-        print(f">>> {phase_title_prefix}[Phase 1/3]: 粗网格 & 零压无力矩冷启动 (Nr={c_Nr}, Nt={c_Nt}, Nz={c_Nz}, P=0.0)")
-        print("="*70)
-        self.update_grid(c_Nr, c_Nt, c_Nz)
         proj_phase1 = {
             "outer_loops": 2,
             "lsq_chunk_nfev": 90,
             "use_weight_continuation": True,
-            "alpha_1d": 1.0,
-            "alpha_tR": 1.0,
-            "alpha_tZ": 1.0,
-            "alpha_lam": 5.0,
-            "alpha_lam_start_factor": 1.5,
         }
-        res_phase1 = self._run_optimization(
-            x0,
-            max_nfev=200,
-            ftol=1e-3,
-            pressure_scale_factor=0.0,
-            projection_cfg=proj_phase1,
-        )
-        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
-
-        print("\n" + "="*70)
-        print(f">>> {phase_title_prefix}[Phase 2/3]: 中网格 & 低压等离子体过渡 (Nr={m_Nr}, Nt={m_Nt}, Nz={m_Nz}, P=0.1)")
-        print("="*70)
-        self.update_grid(m_Nr, m_Nt, m_Nz)
         proj_phase2 = {
             "outer_loops": 3,
             "lsq_chunk_nfev": 110,
             "use_weight_continuation": True,
-            "alpha_1d": 0.5,
-            "alpha_tR": 0.5,
-            "alpha_tZ": 0.5,
-            "alpha_lam": 3.0,
-            "alpha_lam_start_factor": 1.4,
         }
-        res_phase2 = self._run_optimization(
-            res_phase1.x,
-            max_nfev=300,
-            ftol=1e-5,
-            pressure_scale_factor=0.1,
-            projection_cfg=proj_phase2,
-        )
-        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
-
-        print("\n" + "="*70)
-        print(f">>> {phase_title_prefix}[Phase 3/3]: 高保真网格 & 目标高压极限收敛 (Nr={h_Nr}, Nt={h_Nt}, Nz={h_Nz}, P=1.0)")
-        print("="*70)
-        self.update_grid(h_Nr, h_Nt, h_Nz)
         proj_phase3 = {
             "outer_loops": 2,
             "lsq_chunk_nfev": 800,
-            "main_phys_weight": 10.0,
+            "main_phys_weight": 1.0,
             "use_weight_continuation": True,
-            "alpha_1d": 0.2,
-            "alpha_tR": 0.2,
-            "alpha_tZ": 0.2,
-            "alpha_lam": 1.0,
-            "alpha_tR_start_factor": 1.2,
-            "alpha_tZ_start_factor": 1.2,
-            "alpha_lam_start_factor": 1.3,
+            "phys_weight_start_factor": 1.0,
         }
-        res_fine = self._run_optimization(
-            res_phase2.x,
-            max_nfev=1600,
-            ftol=1e-12,
-            pressure_scale_factor=1.0,
-            projection_cfg=proj_phase3,
-        )
-        self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
+
+        if is_pilot:
+            proj_phase1_pilot = proj_phase1.copy()
+            proj_phase1_pilot["ftol"] = 1e-4
+            proj_phase1_pilot["gtol"] = 1e-4
+            phases = [
+                {
+                    "label": "PreFilter-Pilot",
+                    "grid": (c_Nr, c_Nt, c_Nz),
+                    "pressure_scale_factor": 0.0,
+                    "max_nfev": 120,
+                    "ftol": 1e-4,
+                    "projection_cfg": proj_phase1_pilot,
+                    "desc": "预运行短路冷启动",
+                }
+            ]
+            print(">>> [Pilot Run] 预运行已短路: 仅执行粗网格冷启动以探查参数对称性。")
+        else:
+            phases = [
+                {
+                    "label": "Phase 1/3 (Cold Start, L=3)",
+                    "L_rad": 3,
+                    "grid": (c_Nr, c_Nt, c_Nz),
+                    "pressure_scale_factor": 0.0,
+                    "max_nfev": 200,
+                    "ftol": 1e-3,
+                    "projection_cfg": proj_phase1,
+                    "desc": "粗网格 & 零压无力矩冷启动, L=3 谱阶",
+                },
+                {
+                    "label": "Phase 2/3 (Beta Transition, L=4)",
+                    "L_rad": 4,
+                    "grid": (m_Nr, m_Nt, m_Nz),
+                    "pressure_scale_factor": 0.1,
+                    "max_nfev": 300,
+                    "ftol": 1e-5,
+                    "projection_cfg": proj_phase2,
+                    "desc": "中网格 & 低压等离子体过渡, L=4 谱阶",
+                },
+                {
+                    "label": f"Phase 3/3 (High Fidelity, L={L_target})",
+                    "L_rad": L_target,
+                    "grid": (h_Nr, h_Nt, h_Nz),
+                    "pressure_scale_factor": 1.0,
+                    "max_nfev": 1600,
+                    "ftol": 1e-12,
+                    "projection_cfg": proj_phase3,
+                    "desc": f"高保真 & 全径向阶 L={L_target} 收敛",
+                },
+            ]
+
+        phase_results = []
+        x_curr = x0
+        for phase in phases:
+            if (not is_pilot) and "L_rad" in phase:
+                L_ph = int(phase["L_rad"])
+                if L_ph != L_prev:
+                    if x_curr.size > 0:
+                        x_curr = self._core_x_to_L(x_curr, L_prev, L_ph)
+                    self._set_spectral_L(L_ph, mask_full, val_full, L_target)
+                    x_curr = self._apply_fixed_core(x_curr)
+                    L_prev = L_ph
+            Nr, Nt, Nz = phase["grid"]
+            pscale = float(phase["pressure_scale_factor"])
+            proj_cfg = phase["projection_cfg"]
+            ftol_phase = float(proj_cfg.get("ftol", phase["ftol"]))
+            gtol_phase = float(proj_cfg.get("gtol", phase.get("gtol", ftol_phase)))
+            print("\n" + "="*70)
+            print(
+                f">>> {phase_title_prefix}[{phase['label']}]: {phase['desc']} "
+                f"(Nr={Nr}, Nt={Nt}, Nz={Nz}, L_rad={self.L_rad}, P={pscale})"
+            )
+            print("="*70)
+            self.update_grid(Nr, Nt, Nz)
+            res_now = self._run_optimization(
+                x_curr,
+                max_nfev=int(phase["max_nfev"]),
+                ftol=ftol_phase,
+                pressure_scale_factor=pscale,
+                projection_cfg=proj_cfg,
+                gtol=gtol_phase,
+            )
+            self._all_eval_history.extend(getattr(self, "_last_eval_history", []))
+            phase_results.append(res_now)
+            x_curr = res_now.x
+
+        if len(phase_results) == 1:
+            res_phase1 = phase_results[0]
+            res_phase2 = phase_results[0]
+            res_fine = phase_results[0]
+        else:
+            res_phase1, res_phase2, res_fine = phase_results[0], phase_results[1], phase_results[2]
         phase_total_end_time = time.time()
         return res_phase1, res_phase2, res_fine, phase_total_end_time - phase_total_start_time
 
@@ -2277,16 +2655,18 @@ class VEQ3D_Solver:
         pilot._reset_core_freeze_state()
 
         pilot.N_fp = self.N_fp
+        pilot.Phi_a_physical = self.Phi_a_physical
         pilot.Phi_a = self.Phi_a
+        pilot.mu_0_physical = self.mu_0_physical
         pilot.mu_0 = self.mu_0
         pilot.det_chirality = self.det_chirality
-        pilot.regularization_scale = self.regularization_scale
         pilot.target_Nr = self.target_Nr
         pilot.target_Nt = self.target_Nt
         pilot.target_Nz = self.target_Nz
         print(f">>> 预运行实际维度: (M={pilot.M_pol}, N={pilot.N_tor}, L={pilot.L_rad})")
         pilot.update_grid(pilot.target_Nr, pilot.target_Nt, pilot.target_Nz)
         pilot.fit_boundary()
+        pilot._apply_nondim_normalization_from_fitted_boundary()
         pilot._initialize_scaling()
         pilot._check_rho_derivative_stability(
             x_core=np.zeros(pilot.num_core_params),
@@ -2295,7 +2675,10 @@ class VEQ3D_Solver:
             raise_on_fail=True,
         )
 
-        _, _, pilot_res, pilot_elapsed = pilot._run_three_phase_optimization(phase_title_prefix="[PreFilter] ")
+        _, _, pilot_res, pilot_elapsed = pilot._run_three_phase_optimization(
+            phase_title_prefix="[PreFilter] ",
+            is_pilot=True,
+        )
         freeze_mask, freeze_vals = self._build_prefilter_freeze_mask(pilot, pilot_res.x, tol=tol)
         self.core_fixed_mask = freeze_mask
         self.core_fixed_values = freeze_vals
@@ -2307,7 +2690,7 @@ class VEQ3D_Solver:
         print(f">>> 参数冻结结果: 固定 {n_fixed}/{n_total} 个核心参数，自由参数 {n_total - n_fixed} 个")
         reg_stats = self._regularization_active_stats()
         print(
-            ">>> 正则有效自由度: "
+            ">>> 谱模态活跃自由度: "
             f"tR {reg_stats['tR_active']}/{reg_stats['tR_total']}, "
             f"tZ {reg_stats['tZ_active']}/{reg_stats['tZ_total']}, "
             f"Lambda {reg_stats['lam_active']}/{reg_stats['lam_total']}"
@@ -2389,7 +2772,10 @@ class VEQ3D_Solver:
             L_fac_rad_m = (rho ** m) * (1 - rho**2)**2 * T
             lam = lam + np.tensordot(c_lam[:, i], L_fac_rad_m, axes=(0, 0)) * np.sin(m * theta - n * zeta)
             
-        return R, Z, thR, thZ, a, k, lam
+        # 内部求解坐标为无量纲量，这里转回物理长度，保证外部可视化/对比接口不变。
+        # lam 返回的是无量纲流函数 \hat{Lambda}（按 B0*L0^2 归一化）。
+        L0 = float(getattr(self, "L0", 1.0))
+        return R * L0, Z * L0, thR, thZ, a * L0, k, lam
 
     def print_final_parameters(self, x_core):
         table_width = max(110, 46 + self.L_rad * 25)
@@ -2464,15 +2850,20 @@ class VEQ3D_Solver:
     def plot_equilibrium(self, x_core):
         import os
         zetas = [0, np.pi/3, 2*np.pi/3, np.pi, 4*np.pi/3, 5*np.pi/3]
-        
+        # 可视化专用网格：略粗于旧版(50x100)即可；与矢量化 compute_geometry 配合，远快于标量双循环
+        _nr, _nt = 40, 64
+        rp = np.linspace(0, 1, _nr)
+        tp = np.linspace(0, 2 * np.pi, _nt)
+        R_P, T_P = np.meshgrid(rp, tp)
+
         # 尝试加载 DESC 的对比数据
         desc_data = None
         unique_zetas = None
         zeta_match_tol = 0.1
-        if os.path.exists("p0.txt"):
+        if os.path.exists("RZ_data.txt"):
             try:
                 t0 = time.time()
-                desc_data = np.loadtxt("p0.txt", delimiter=',', skiprows=1)
+                desc_data = np.loadtxt("RZ_data.txt", delimiter=',', skiprows=1)
                 t1 = time.time()
                 # 统一将第三列角度转换为求解器内部 zeta
                 desc_data[:, 2] = self._desc_phi_to_solver_zeta(desc_data[:, 2])
@@ -2482,7 +2873,7 @@ class VEQ3D_Solver:
                     zeta_step = np.min(np.diff(unique_zetas))
                     # 自适应阈值：至少覆盖半个离散步长，避免 zeta=pi 这类临界漏匹配
                     zeta_match_tol = max(0.1, 0.55 * zeta_step)
-                print("    >>> 成功加载 DESC 对比数据 p0.txt")
+                print("    >>> 成功加载 DESC 对比数据 RZ_data.txt")
                 print("    >>> 已应用角度统一转换: zeta = N_fp * phi (mod 2pi)")
                 print(f"    >>> DESC 数据读取耗时: {t1 - t0:.3f} s | 角度转换耗时: {t2 - t1:.3f} s")
             except Exception as e:
@@ -2490,9 +2881,8 @@ class VEQ3D_Solver:
 
         fig, axes = plt.subplots(2, 3, figsize=(15, 12))
         axes = axes.flatten()
-        rp = np.linspace(0, 1, 50); tp = np.linspace(0, 2*np.pi, 100)
-        R_P, T_P = np.meshgrid(rp, tp); PSI_P = self.compute_psi(R_P)
-        
+        PSI_P = self.compute_psi(R_P)
+
         # 与 DESC 数据对比误差累计量
         total_squared_error = 0.0
         total_matched_points = 0
@@ -2500,12 +2890,19 @@ class VEQ3D_Solver:
         total_sum_true_r = 0.0
         total_sum_true_z = 0.0
         for i, zv in enumerate(zetas):
-            ax = axes[i]; Rm, Zm = [], []
-            for r, t in zip(R_P.flatten(), T_P.flatten()):
-                rg = self.compute_geometry(x_core, r, t, zv)
-                Rm.append(rg[0]); Zm.append(rg[1])
-            Rm = np.array(Rm).reshape(R_P.shape); Zm = np.array(Zm).reshape(R_P.shape)
-            ax.tripcolor(Rm.flatten(), Zm.flatten(), PSI_P.flatten(), shading='gouraud', cmap='magma', alpha=0.9)
+            ax = axes[i]
+            ZETA = np.full(R_P.shape, zv, dtype=np.float64)
+            Rm, Zm, *_ = self.compute_geometry(x_core, R_P, T_P, ZETA)
+            # 结构网格上的着色：pcolormesh 比 tripcolor(数千三角形) 快一个量级
+            ax.pcolormesh(
+                Rm,
+                Zm,
+                PSI_P,
+                shading="gouraud",
+                cmap="magma",
+                alpha=0.9,
+                rasterized=True,
+            )
             
             # 绘制 VEQ3D 内部磁面
             for r_lev in [0.2, 0.4, 0.6, 0.8, 1.0]:
